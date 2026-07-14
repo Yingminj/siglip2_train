@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+
+siglip2-so400m-patch14-224/model.safetensors

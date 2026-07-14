@@ -1,0 +1,438 @@
+"""
+Multi-View SigLIP2 Models (V2: Patch-Level Cross-View Attention Pooling)
+========================================================================
+
+Architecture (following PaliGemma/pi0 pattern):
+  - SigLIP2 completely frozen, used as pure feature extractor
+  - Uses last_hidden_state (patch tokens) instead of pooler_output
+  - CrossViewAttentionPooler: learnable queries cross-attend to all patch tokens
+  - View position embeddings distinguish camera origins
+
+Modules:
+  - MultiViewSimpleDataset: splits 2x2 grid images into 4 views
+  - CrossViewAttentionPooler: query-based cross-attention fusion
+  - MultiViewSigLIPModel: frozen SigLIP + trainable pooler
+  - setup_multiview_model: model construction and optimizer
+"""
+
+import os
+
+import torch
+from torch import nn, optim
+from PIL import Image
+from transformers import AutoModel, AutoProcessor
+
+from .datasets import SimpleDataset
+from .augmentation import SigLIPAugmentation
+
+
+# =============================================================================
+# Multi-View Dataset
+# =============================================================================
+
+class MultiViewSimpleDataset(SimpleDataset):
+    """
+    Extends SimpleDataset to split composite images into individual views.
+
+    Supported layouts (auto-detected by aspect ratio):
+      - 1x3 horizontal (1920x480): 3 views of 640x480 [left_wrist, right_wrist, head]
+      - 2x2 grid (1920x1488): 4 views of 960x744
+
+    Text loading is skipped since text data is not used in V2.
+    """
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+
+        # Load composite image
+        with Image.open(sample['image_path']) as img_file:
+            image = img_file.convert('RGB')
+            image.load()
+
+        views = split_image_to_views(image)
+
+        # Apply augmentation to each view independently
+        if self.augment_fn is not None:
+            views = [self.augment_fn(v) for v in views]
+
+        return {
+            'views': views,
+            'label': self.class_to_idx[sample['class']],
+            'class': sample['class'],
+        }
+
+
+def split_image_to_views(image):
+    """
+    Split a composite PIL Image into view crops.
+    Auto-detects layout by aspect ratio:
+      - width/height > 3.0: 1x3 horizontal (1920x480 → 3 views of 640x480)
+      - otherwise: 2x2 grid (1920x1488 → 4 views of 960x744)
+    """
+    w, h = image.size
+    if w / h > 3.0:
+        # 1x3 horizontal: [head | wrist_left | wrist_right]  (index 0=head)
+        view_w = w // 3
+        return [
+            image.crop((0, 0, view_w, h)),
+            image.crop((view_w, 0, 2 * view_w, h)),
+            image.crop((2 * view_w, 0, w, h)),
+        ]
+    else:
+        # 2x2 grid
+        half_w, half_h = w // 2, h // 2
+        return [
+            image.crop((0, 0, half_w, half_h)),
+            image.crop((half_w, 0, w, half_h)),
+            image.crop((0, half_h, half_w, h)),
+            image.crop((half_w, half_h, w, h)),
+    ]
+
+
+def make_multiview_collate_fn(processor, config):
+    """
+    Collate function for MultiViewSimpleDataset.
+    Flattens 4 views per sample into a single batch of images.
+    No text processing (V2: SupCon only).
+    """
+    def collate_fn(batch):
+        # Flatten views: 4 views per sample -> 4*B images
+        all_views = []
+        for item in batch:
+            all_views.extend(item['views'])
+
+        labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
+
+        # Process images (4*B) through processor
+        image_inputs = processor(images=all_views, return_tensors="pt")
+
+        result = {k: v for k, v in image_inputs.items()}
+        result['labels'] = labels
+
+        return result
+
+    return collate_fn
+
+
+# =============================================================================
+# Cross-View Attention Pooler (replaces MultiViewFusion from V1)
+# =============================================================================
+
+class CrossViewAttentionPooler(nn.Module):
+    """
+    Cross-attention pooler that aggregates 1024 patch tokens into a single embedding.
+
+    Architecture:
+      - num_queries learnable query tokens [Q, D]
+      - Multi-layer cross-attention: queries attend to all patch tokens (K, V)
+      - Mean pool over queries -> single vector
+      - LayerNorm for output stability
+
+    Input:  [B, N_patches, D]  (e.g., 4 views x 256 patches = 1024 tokens)
+    Output: [B, D]
+    """
+
+    def __init__(self, embed_dim=1152, num_queries=8, num_heads=8,
+                 num_layers=2, dropout=0.1, num_views=3, view_bias_init=None):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_queries = num_queries
+        self.num_views = num_views
+
+        # Learnable per-view attention bias (logit space).
+        # Added to cross-attention logits so some views get more attention mass.
+        # view_bias_init e.g. [1.0, 0.0, 0.0] -> head (index 0) starts ~e^1 stronger.
+        if view_bias_init is None:
+            init = torch.zeros(num_views)
+        else:
+            init = torch.tensor(view_bias_init, dtype=torch.float32)
+            assert init.numel() == num_views, \
+                f"view_bias_init length {init.numel()} != num_views {num_views}"
+        self.view_logits = nn.Parameter(init)
+
+        # Learnable query tokens
+        self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, embed_dim))
+
+        # Cross-attention layers
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.layers.append(nn.ModuleDict({
+                'cross_attn': nn.MultiheadAttention(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    batch_first=True,
+                ),
+                'norm1': nn.LayerNorm(embed_dim),
+                'norm2': nn.LayerNorm(embed_dim),
+                'ffn': nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim * 4),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(embed_dim * 4, embed_dim),
+                    nn.Dropout(dropout),
+                ),
+            }))
+
+        # Output normalization
+        self.output_ln = nn.LayerNorm(embed_dim)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.query_tokens, std=0.02)
+        for layer in self.layers:
+            nn.init.xavier_uniform_(layer['cross_attn'].in_proj_weight)
+            nn.init.xavier_uniform_(layer['ffn'][0].weight)
+            nn.init.xavier_uniform_(layer['ffn'][3].weight)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, N_patches, D] concatenated patch tokens from all views
+        Returns:
+            [B, D] fused embedding
+        """
+        B, S, _ = x.shape
+
+        # Per-view attention bias: expand [num_views] -> [S] -> [Q, S] (additive mask)
+        num_patches = S // self.num_views
+        key_bias = self.view_logits.repeat_interleave(num_patches)        # [S]
+        attn_mask = key_bias.unsqueeze(0).expand(self.num_queries, S)     # [Q, S]
+
+        # Expand queries to batch size
+        queries = self.query_tokens.expand(B, -1, -1)  # [B, Q, D]
+
+        # Cross-attention layers (pre-norm style)
+        for layer in self.layers:
+            # Cross-attention: queries attend to patch tokens
+            residual = queries
+            queries = layer['norm1'](queries)
+            queries = layer['cross_attn'](
+                query=queries,
+                key=x,
+                value=x,
+                attn_mask=attn_mask,
+            )[0] + residual
+
+            # FFN
+            residual = queries
+            queries = layer['norm2'](queries)
+            queries = layer['ffn'](queries) + residual
+
+        # Mean pool over query tokens -> [B, D]
+        output = queries.mean(dim=1)
+
+        # Output LayerNorm
+        output = self.output_ln(output)
+
+        return output
+
+
+# =============================================================================
+# Multi-View SigLIP2 Model Wrapper (V2)
+# =============================================================================
+
+class MultiViewSigLIPModel(nn.Module):
+    """
+    Wraps frozen SigLIP2 + CrossViewAttentionPooler.
+
+    Flow:
+      pixel_values [4B, C, H, W]
+        -> SigLIP vision_model (frozen, no_grad)
+        -> last_hidden_state [4B, 256, D]
+        -> reshape [B, 4, 256, D]
+        -> + view_position_embedding [4, 1, D]
+        -> reshape [B, 1024, D]
+        -> CrossViewAttentionPooler -> [B, D]
+        -> L2 normalize
+    """
+
+    def __init__(self, base_model, pooler, num_views=4, embed_dim=1152):
+        super().__init__()
+        self.base_model = base_model
+        self.pooler = pooler
+        self.num_views = num_views
+
+        # View position embedding: [num_views, 1, D]
+        # Broadcast-added to each view's 256 patch tokens
+        self.view_pos_embed = nn.Parameter(
+            torch.zeros(num_views, 1, embed_dim)
+        )
+        nn.init.trunc_normal_(self.view_pos_embed, std=0.02)
+
+        # Expose config for compatibility
+        self.config = base_model.config
+
+    def encode_views(self, pixel_values):
+        """
+        Encode multi-view images and fuse into a single embedding.
+
+        Args:
+            pixel_values: [B*num_views, C, H, W]
+        Returns:
+            [B, D] L2-normalized fused embedding
+        """
+        # SigLIP forward (frozen, no gradient)
+        with torch.no_grad():
+            vision_outputs = self.base_model.vision_model(pixel_values=pixel_values)
+            patch_tokens = vision_outputs.last_hidden_state  # [B*V, 256, D]
+
+        B_total = patch_tokens.shape[0]
+        B = B_total // self.num_views
+        num_patches = patch_tokens.shape[1]  # 256
+        D = patch_tokens.shape[2]
+
+        # Reshape: [B*V, 256, D] -> [B, V, 256, D]
+        patch_tokens = patch_tokens.view(B, self.num_views, num_patches, D)
+
+        # Add view position embedding: [V, 1, D] broadcasts to [B, V, 256, D]
+        patch_tokens = patch_tokens + self.view_pos_embed.unsqueeze(0)
+
+        # Flatten views: [B, V, 256, D] -> [B, V*256, D] = [B, 1024, D]
+        patch_tokens = patch_tokens.view(B, self.num_views * num_patches, D)
+
+        # Cross-attention pooling
+        fused = self.pooler(patch_tokens)  # [B, D]
+
+        # L2 normalize final output
+        fused = fused / (fused.norm(dim=-1, keepdim=True) + 1e-12)
+        return fused
+
+
+# =============================================================================
+# Model Setup
+# =============================================================================
+
+def setup_multiview_model(config):
+    """
+    Build MultiViewSigLIPModel with frozen SigLIP + trainable pooler.
+
+    Returns:
+        model, processor, optimizer, scheduler
+    """
+    print(f"Loading SigLIP2 base model: {config.SIGLIP_MODEL}")
+    print(f"Device: {config.DEVICE}")
+    print(f"Multi-View: {config.NUM_VIEWS} views")
+
+    base_model = AutoModel.from_pretrained(config.SIGLIP_MODEL)
+    processor = AutoProcessor.from_pretrained(config.SIGLIP_MODEL)
+
+    # Get embedding dimension from model config
+    embed_dim = base_model.config.vision_config.hidden_size
+    print(f"Vision embedding dim: {embed_dim}")
+
+    # Create cross-attention pooler
+    pooler = CrossViewAttentionPooler(
+        embed_dim=embed_dim,
+        num_queries=config.NUM_QUERY_TOKENS,
+        num_heads=config.POOLER_NUM_HEADS,
+        num_layers=config.POOLER_NUM_LAYERS,
+        dropout=config.POOLER_DROPOUT,
+        num_views=config.NUM_VIEWS,
+        view_bias_init=getattr(config, 'VIEW_BIAS_INIT', None),
+    )
+    if getattr(config, 'VIEW_BIAS_INIT', None) is not None:
+        print(f"View attention bias (learnable, init): {config.VIEW_BIAS_INIT} "
+              f"for views {config.VIEW_NAMES}")
+
+    # Wrap into multi-view model
+    model = MultiViewSigLIPModel(
+        base_model, pooler,
+        num_views=config.NUM_VIEWS,
+        embed_dim=embed_dim,
+    )
+    model = model.to(config.DEVICE)
+
+    # ===== Freeze strategy: SigLIP completely frozen =====
+    # Freeze everything first
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze trainable modules: view_pos_embed + pooler
+    model.view_pos_embed.requires_grad = True
+    for param in model.pooler.parameters():
+        param.requires_grad = True
+
+    # Print trainable parameters
+    print("\nTrainable parameters:")
+    trainable_total = 0
+    total_params = 0
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        if param.requires_grad:
+            print(f"  - {name} ({param.numel():,})")
+            trainable_total += param.numel()
+
+    print(f"\nTotal trainable: {trainable_total:,} / Total: {total_params:,} "
+          f"({100 * trainable_total / total_params:.2f}%)")
+    print(f"SigLIP: completely frozen (no gradient computation)")
+
+    # ===== Optimizer (single param group) =====
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    optimizer = optim.AdamW(
+        trainable_params,
+        lr=config.LEARNING_RATE,
+        betas=(0.9, 0.98),
+        eps=1e-6,
+        weight_decay=config.WEIGHT_DECAY,
+    )
+    print(f"\nOptimizer: AdamW, LR={config.LEARNING_RATE:.2e}")
+
+    # ===== Scheduler =====
+    scheduler = None
+    if config.SCHEDULER_TYPE == "warmup_cosine":
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[
+                optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.1, total_iters=config.WARMUP_EPOCHS
+                ),
+                optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=config.EPOCHS - config.WARMUP_EPOCHS,
+                    eta_min=config.MIN_LR,
+                ),
+            ],
+            milestones=[config.WARMUP_EPOCHS],
+        )
+        print(f"Using Warmup ({config.WARMUP_EPOCHS} epochs) + Cosine Annealing LR")
+    elif config.SCHEDULER_TYPE == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.EPOCHS, eta_min=config.MIN_LR
+        )
+
+    return model, processor, optimizer, scheduler
+
+
+def load_multiview_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
+    """Load checkpoint for MultiViewSigLIPModel."""
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    print(f"\nLoading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"  Model weights loaded (base_model + pooler)")
+
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print(f"  Optimizer state loaded")
+
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print(f"  Scheduler state loaded")
+
+    info = {'start_epoch': 0, 'previous_loss': None}
+
+    if 'epoch' in checkpoint:
+        info['start_epoch'] = checkpoint['epoch'] + 1
+        print(f"  Resume from Epoch {info['start_epoch']}")
+    if 'loss' in checkpoint:
+        info['previous_loss'] = checkpoint['loss']
+        print(f"  Previous loss: {checkpoint['loss']:.4f}")
+
+    return info
