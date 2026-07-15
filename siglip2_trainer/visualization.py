@@ -114,3 +114,60 @@ def save_training_summary(loss_history, lr_history, config, final_epoch,
                 f.write(f"{ep}, {acc:.6f}\n")
 
     print(f"Complete training log saved to: {save_path_txt}")
+
+
+def plot_overfitting_diagnostics(eval_history, config):
+    """Plot train-vs-val diagnostics for overfitting inspection."""
+    if not eval_history:
+        return
+
+    save_path_png = os.path.join(config.MODEL_DIR, "overfitting_diagnostics.png")
+    save_path_txt = os.path.join(config.MODEL_DIR, "overfitting_diagnostics.txt")
+
+    epochs = [entry['epoch'] for entry in eval_history]
+    train_acc = [entry['train_accuracy'] * 100 for entry in eval_history]
+    val_acc = [entry['val_accuracy'] * 100 for entry in eval_history]
+    train_margin = [entry['train_margin'] for entry in eval_history]
+    val_margin = [entry['val_margin'] for entry in eval_history]
+    train_true_sim = [entry['train_true_similarity'] for entry in eval_history]
+    val_true_sim = [entry['val_true_similarity'] for entry in eval_history]
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 10), sharex=True)
+
+    axes[0].plot(epochs, train_acc, marker='o', linewidth=2, label='Train accuracy')
+    axes[0].plot(epochs, val_acc, marker='o', linewidth=2, label='Val accuracy')
+    axes[0].set_ylabel('Accuracy (%)')
+    axes[0].set_title('Train vs Val Accuracy')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(epochs, train_margin, marker='o', linewidth=2, label='Train top1 margin')
+    axes[1].plot(epochs, val_margin, marker='o', linewidth=2, label='Val top1 margin')
+    axes[1].plot(epochs, train_true_sim, linestyle='--', linewidth=1.5, label='Train true-class sim')
+    axes[1].plot(epochs, val_true_sim, linestyle='--', linewidth=1.5, label='Val true-class sim')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Cosine similarity')
+    axes[1].set_title('Embedding Confidence Gap')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(save_path_png, dpi=150)
+    plt.close(fig)
+
+    with open(save_path_txt, 'w', encoding='utf-8') as f:
+        f.write("# Overfitting diagnostics\n")
+        f.write("# epoch,train_acc,val_acc,acc_gap,train_margin,val_margin,margin_gap,train_true_sim,val_true_sim,true_sim_gap\n")
+        for entry in eval_history:
+            f.write(
+                f"{entry['epoch']},"
+                f"{entry['train_accuracy']:.6f},"
+                f"{entry['val_accuracy']:.6f},"
+                f"{entry['accuracy_gap']:.6f},"
+                f"{entry['train_margin']:.6f},"
+                f"{entry['val_margin']:.6f},"
+                f"{entry['margin_gap']:.6f},"
+                f"{entry['train_true_similarity']:.6f},"
+                f"{entry['val_true_similarity']:.6f},"
+                f"{entry['true_similarity_gap']:.6f}\n"
+            )

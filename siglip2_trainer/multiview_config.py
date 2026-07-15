@@ -3,7 +3,7 @@ import torch
 
 class MultiViewConfig:
     # === Training parameters ===
-    EPOCHS        = 100
+    EPOCHS        = 50
     BATCH_SIZE    = 64           # SigLIP frozen -> no grad graph -> less VRAM
     LEARNING_RATE = 1e-4         # Single LR for pooler (only trainable module)
     WEIGHT_DECAY  = 0.05
@@ -28,6 +28,7 @@ class MultiViewConfig:
     EVAL_EVERY_N_EPOCHS = 5
     EVAL_SKIP_FIRST_N   = 1
     ENABLE_EVAL         = True
+    TRAIN_EVAL_MAX_SAMPLES = 512  # 每次评估时从训练集均匀抽样的最大样本数，用于判断过拟合
 
     # === Loss (SupCon only, no text) ===
     USE_SUPCON_LOSS    = True
@@ -35,7 +36,7 @@ class MultiViewConfig:
     SUPCON_TEMPERATURE = 0.1
 
     # === Model ===
-    SIGLIP_MODEL = "/home/liuqian/Aqcy/qcy/siglip2-so400m-patch14-224"
+    SIGLIP_MODEL = "/home/liuqian/Aqcy/siglip2_train/siglip2-so400m-patch14-224"
 
     # === Multi-View specific ===
     NUM_VIEWS = 3
@@ -54,7 +55,7 @@ class MultiViewConfig:
     # === Data paths ===
     # "image": class folders; "video": MP4 files with frame-level TXT labels.
     DATA_MODE = "image"
-    IMAGE_ROOT = "/home/liuqian/Aqcy/gift_m6_picture_train40_mult_0713"
+    IMAGE_ROOT = "/home/liuqian/Aqcy/gift_m6_picture_train40_mult_0630"
     VIDEO_ROOT = "/home/liuqian/Aqcy/cube_data/cubedata_multiviewer_0713"
     VIDEO_LABEL_ROOT = "/home/liuqian/Aqcy/cube_data/cubedata_multiviewer_0713_label"
     VIDEO_FRAME_STRIDE = 5       # 1=每帧；5=每 5 帧采一帧

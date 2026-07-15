@@ -19,12 +19,12 @@ class Config:
 
     # Early stopping
     EARLY_STOPPING = True
-    PATIENCE       = 5           # 评估频率增高后，如果连续5次评估（即10个Epoch）不提升，即可停止
+    PATIENCE       = 2           # 评估频率增高后，如果连续5次评估（即10个Epoch）不提升，即可停止
     MIN_DELTA      = 1e-4
 
     # 数据集划分
     VAL_RATIO = 0.1              # 验证集比例（用于评估和 early stopping）
-    EVAL_EVERY_N_EPOCHS = 5     # 每5个epoch评估一次
+    EVAL_EVERY_N_EPOCHS = 1     # 每5个epoch评估一次
     EVAL_SKIP_FIRST_N  = 1    # 前N个epoch跳过评估和特征中心计算，加速训练初期
     ENABLE_EVAL = True           # 开启评估，用于 early stopping 和准确率监控
 
@@ -54,7 +54,7 @@ class Config:
     NUM_QUERY_TOKENS   = 8       # Learnable query tokens for cross-attention
     POOLER_NUM_LAYERS  = 2       # Cross-attention layers
     POOLER_NUM_HEADS   = 8       # Attention heads
-    POOLER_DROPOUT     = 0.1
+    POOLER_DROPOUT     = 0.3
 
     # Data paths
     IMAGE_ROOT = "/home/kewei/spatial_encoder/clip/data/train_data/0625_grasp"

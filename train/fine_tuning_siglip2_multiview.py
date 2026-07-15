@@ -45,7 +45,11 @@ from siglip2_trainer.multiview_models import (
 from siglip2_trainer.multiview_video_dataset import MultiViewVideoDataset
 from siglip2_trainer.losses import SupConLoss
 from siglip2_trainer.checkpoints import CheckpointManager, EarlyStopping
-from siglip2_trainer.visualization import plot_loss_curve, save_training_summary
+from siglip2_trainer.visualization import (
+    plot_loss_curve,
+    plot_overfitting_diagnostics,
+    save_training_summary,
+)
 from siglip2_trainer.logging_utils import (
     NumpyEncoder, save_training_config,
     collect_dataset_info, collect_model_info,
@@ -244,9 +248,12 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
 
     class_list = sorted(class_centers.keys())
     num_classes = len(class_list)
+    class_to_idx = {cls: idx for idx, cls in enumerate(class_list)}
 
     correct = 0
     total = 0
+    margin_sum = 0.0
+    true_similarity_sum = 0.0
     per_class_correct = {cls: 0 for cls in class_list}
     per_class_total = {cls: 0 for cls in class_list}
     confusion_matrix = {(t, p): 0 for t in class_list for p in class_list}
@@ -279,9 +286,20 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
             for i, (vec, true_cls) in enumerate(zip(fused_embeds.cpu(), batch_true_classes)):
                 vec_np = vec.numpy()
 
-                similarities = {}
-                for cls, center in class_centers.items():
-                    similarities[cls] = float(np.dot(vec_np, center))
+                similarities = {
+                    cls: float(np.dot(vec_np, center))
+                    for cls, center in class_centers.items()
+                }
+                sim_values = np.array([similarities[cls] for cls in class_list])
+                sorted_indices = np.argsort(sim_values)[::-1]
+                true_idx = class_to_idx[true_cls]
+                true_similarity_sum += float(sim_values[true_idx])
+                second_best = (
+                    float(sim_values[sorted_indices[1]])
+                    if len(sorted_indices) > 1
+                    else float(sim_values[sorted_indices[0]])
+                )
+                margin_sum += float(sim_values[sorted_indices[0]] - second_best)
 
                 pred_cls = max(similarities.items(), key=lambda x: x[1])[0]
 
@@ -320,11 +338,17 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
         'accuracy': accuracy,
         'correct': correct,
         'total': total,
+        'avg_margin': margin_sum / total if total > 0 else 0.0,
+        'avg_true_similarity': true_similarity_sum / total if total > 0 else 0.0,
         'per_class_accuracy': per_class_accuracy,
         'num_classes': num_classes
     }
 
     print(f"  Overall accuracy: {accuracy:.1%} ({correct}/{total})")
+    print(
+        f"  Avg top1 margin: {metrics['avg_margin']:.4f}, "
+        f"Avg true-class sim: {metrics['avg_true_similarity']:.4f}"
+    )
     print(f"\n  Per-class accuracy:")
     for cls in class_list:
         acc = per_class_accuracy[cls]
@@ -372,6 +396,8 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
             'correct': int(correct),
             'total': int(total),
             'num_classes': int(num_classes),
+            'avg_margin': float(metrics['avg_margin']),
+            'avg_true_similarity': float(metrics['avg_true_similarity']),
             'per_class_accuracy': {k: float(v) for k, v in per_class_accuracy.items()}
         },
         'confusion_matrix': {
@@ -402,6 +428,127 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
     print(f"{'='*60}\n")
 
     return metrics
+
+
+def evaluate_multiview_split_diagnostics(
+    model, processor, dataset, class_centers, config, split_name,
+    max_samples=None,
+):
+    """Evaluate a dataset split without saving heavy visualizations."""
+    model.eval()
+
+    class_list = sorted(class_centers.keys())
+    class_to_idx = {cls: idx for idx, cls in enumerate(class_list)}
+    correct = 0
+    total = 0
+    margin_sum = 0.0
+    true_similarity_sum = 0.0
+
+    if max_samples is not None and len(dataset) > max_samples:
+        eval_indices = np.round(
+            np.linspace(0, len(dataset) - 1, max_samples)
+        ).astype(int).tolist()
+    else:
+        eval_indices = list(range(len(dataset)))
+
+    batch_size = 8
+
+    with torch.no_grad():
+        for start in range(0, len(eval_indices), batch_size):
+            batch_indices = eval_indices[start:start + batch_size]
+            batch_views = []
+            batch_true_classes = []
+
+            for idx in batch_indices:
+                sample_meta = dataset.samples[idx]
+                if 'image_path' in sample_meta:
+                    with Image.open(sample_meta['image_path']) as img:
+                        img = img.convert('RGB')
+                        img.load()
+                    views = split_image_to_views(img)
+                else:
+                    views = dataset.load_views(sample_meta, apply_augmentation=False)
+                batch_views.extend(views)
+                batch_true_classes.append(sample_meta['class'])
+
+            inputs = processor(images=batch_views, return_tensors="pt")
+            pixel_values = inputs['pixel_values'].to(config.DEVICE)
+            fused_embeds = model.encode_views(pixel_values)
+
+            for vec, true_cls in zip(fused_embeds.cpu().numpy(), batch_true_classes):
+                sims = np.array([float(np.dot(vec, class_centers[cls])) for cls in class_list])
+                sorted_indices = np.argsort(sims)[::-1]
+                pred_cls = class_list[sorted_indices[0]]
+                true_idx = class_to_idx[true_cls]
+                true_sim = float(sims[true_idx])
+                second_best = float(sims[sorted_indices[1]]) if len(sorted_indices) > 1 else true_sim
+
+                total += 1
+                correct += int(pred_cls == true_cls)
+                true_similarity_sum += true_sim
+                margin_sum += float(sims[sorted_indices[0]] - second_best)
+
+    if hasattr(dataset, 'close'):
+        dataset.close()
+    model.train()
+
+    accuracy = correct / total if total > 0 else 0.0
+    avg_margin = margin_sum / total if total > 0 else 0.0
+    avg_true_similarity = true_similarity_sum / total if total > 0 else 0.0
+
+    print(
+        f"  {split_name}: accuracy={accuracy:.1%}, "
+        f"avg_margin={avg_margin:.4f}, avg_true_sim={avg_true_similarity:.4f}, "
+        f"samples={total}"
+    )
+
+    return {
+        'split': split_name,
+        'accuracy': accuracy,
+        'avg_margin': avg_margin,
+        'avg_true_similarity': avg_true_similarity,
+        'num_samples': total,
+    }
+
+
+def save_best_checkpoint_summary(
+    config,
+    best_loss,
+    best_loss_epoch,
+    best_eval_accuracy,
+    best_eval_epoch,
+    overfit_history=None,
+):
+    """Persist the current best-checkpoint summary for later testing."""
+    summary_path = os.path.join(config.MODEL_DIR, 'best_checkpoint_summary.json')
+    summary = {
+        'model_name': config.MODEL_NAME,
+        'best_loss': None if best_loss is None else float(best_loss),
+        'best_loss_epoch': None if best_loss_epoch is None else int(best_loss_epoch),
+        'best_loss_checkpoint': os.path.join(
+            config.MODEL_DIR, f"{config.MODEL_NAME}_best_loss.pt"
+        ),
+        'best_eval_accuracy': (
+            None if best_eval_accuracy is None else float(best_eval_accuracy)
+        ),
+        'best_eval_epoch': None if best_eval_epoch is None else int(best_eval_epoch),
+        'best_eval_checkpoint': os.path.join(
+            config.MODEL_DIR, f"{config.MODEL_NAME}_best_eval.pt"
+        ),
+        'recommended_for_test': 'best_eval',
+    }
+
+    if overfit_history:
+        latest = overfit_history[-1]
+        summary['latest_generalization_gap'] = {
+            'epoch': int(latest['epoch']),
+            'accuracy_gap': float(latest['accuracy_gap']),
+            'margin_gap': float(latest['margin_gap']),
+            'true_similarity_gap': float(latest['true_similarity_gap']),
+        }
+
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2)
 
 
 # =============================================================================
@@ -623,6 +770,7 @@ def main():
     lr_history = []
     accuracy_history = []
     accuracy_epochs = []
+    overfit_history = []
     best_loss_updated = False
 
     epoch = start_epoch - 1
@@ -646,6 +794,14 @@ def main():
             best_loss_epoch = epoch
             best_loss_updated = True
             checkpoint_manager.save_best_loss(model, optimizer, epoch, avg_loss, current_lr, scheduler)
+            save_best_checkpoint_summary(
+                config,
+                best_loss,
+                best_loss_epoch,
+                best_eval_accuracy,
+                best_eval_epoch,
+                overfit_history,
+            )
 
         _cached_centers = None
         _cached_centers_epoch = None
@@ -697,16 +853,57 @@ def main():
                 metrics = evaluate_multiview_with_class_centers(
                     model, processor, val_dataset, class_centers, config, epoch
                 )
+                train_diag = evaluate_multiview_split_diagnostics(
+                    model,
+                    processor,
+                    train_dataset,
+                    class_centers,
+                    config,
+                    split_name='train',
+                    max_samples=getattr(config, 'TRAIN_EVAL_MAX_SAMPLES', None),
+                )
 
                 print(f"Evaluation done (accuracy: {metrics['accuracy']:.1%})")
+                print(
+                    f"Generalization gap: "
+                    f"acc={train_diag['accuracy'] - metrics['accuracy']:+.1%}, "
+                    f"margin={train_diag['avg_margin'] - metrics['avg_margin']:+.4f}, "
+                    f"true_sim={train_diag['avg_true_similarity'] - metrics['avg_true_similarity']:+.4f}"
+                )
 
                 accuracy_history.append(metrics['accuracy'])
                 accuracy_epochs.append(epoch)
+                overfit_history.append({
+                    'epoch': int(epoch),
+                    'train_accuracy': float(train_diag['accuracy']),
+                    'val_accuracy': float(metrics['accuracy']),
+                    'accuracy_gap': float(train_diag['accuracy'] - metrics['accuracy']),
+                    'train_margin': float(train_diag['avg_margin']),
+                    'val_margin': float(metrics['avg_margin']),
+                    'margin_gap': float(train_diag['avg_margin'] - metrics['avg_margin']),
+                    'train_true_similarity': float(train_diag['avg_true_similarity']),
+                    'val_true_similarity': float(metrics['avg_true_similarity']),
+                    'true_similarity_gap': float(
+                        train_diag['avg_true_similarity'] - metrics['avg_true_similarity']
+                    ),
+                })
+                plot_overfitting_diagnostics(overfit_history, config)
+                overfit_json = os.path.join(config.MODEL_DIR, 'overfitting_diagnostics.json')
+                with open(overfit_json, 'w', encoding='utf-8') as f:
+                    json.dump(overfit_history, f, indent=2)
 
                 if (best_eval_accuracy is None or
                         metrics['accuracy'] > best_eval_accuracy + config.MIN_DELTA):
                     best_eval_accuracy = metrics['accuracy']
                     best_eval_epoch = epoch
+                    save_best_checkpoint_summary(
+                        config,
+                        best_loss,
+                        best_loss_epoch,
+                        best_eval_accuracy,
+                        best_eval_epoch,
+                        overfit_history,
+                    )
 
                 if early_stopping is not None:
                     should_stop = early_stopping(metrics['accuracy'], epoch)
@@ -795,6 +992,15 @@ def main():
                     current_epoch=epoch, current_loss=loss_history[-1],
                     accuracy_history=accuracy_history, accuracy_epochs=accuracy_epochs,
                     val_accuracy=accuracy_history[-1] if accuracy_history else None)
+    plot_overfitting_diagnostics(overfit_history, config)
+    save_best_checkpoint_summary(
+        config,
+        best_loss,
+        best_loss_epoch,
+        best_eval_accuracy,
+        best_eval_epoch,
+        overfit_history,
+    )
     save_training_summary(loss_history, lr_history, config, epoch,
                          accuracy_history, accuracy_epochs)
 
