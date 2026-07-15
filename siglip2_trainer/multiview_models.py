@@ -3,9 +3,10 @@ Multi-View SigLIP2 Models (V2: Patch-Level Cross-View Attention Pooling)
 ========================================================================
 
 Architecture (following PaliGemma/pi0 pattern):
-  - SigLIP2 completely frozen, used as pure feature extractor
+  - SigLIP2 towers frozen, with trainable vision post-LayerNorm
   - Uses last_hidden_state (patch tokens) instead of pooler_output
   - CrossViewAttentionPooler: learnable queries cross-attend to all patch tokens
+  - Frozen class-text queries perform gated cross-attention over image tokens
   - View position embeddings distinguish camera origins
 
 Modules:
@@ -19,6 +20,7 @@ import os
 
 import torch
 from torch import nn, optim
+import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoModel, AutoProcessor
 
@@ -229,6 +231,104 @@ class CrossViewAttentionPooler(nn.Module):
         return output
 
 
+class TextConditionedGatedCrossAttention(nn.Module):
+    """Score every candidate class text against the multi-view image tokens.
+
+    Class text embeddings are queries and image patch tokens are keys/values.
+    Every image is compared with every class query, so the ground-truth label is
+    never injected into the input.  The gate follows the idea used by GenLIP,
+    but is kept separate from q_proj so pretrained SigLIP weights remain intact.
+    """
+
+    def __init__(self, embed_dim=1152, num_heads=8, dropout=0.1,
+                 gate_bias_init=4.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+
+        self.query_norm = nn.LayerNorm(embed_dim)
+        self.image_norm = nn.LayerNorm(embed_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.gate_proj = nn.Linear(embed_dim, embed_dim)
+        self.output_norm = nn.LayerNorm(embed_dim)
+        self.logit_scale = nn.Parameter(torch.tensor(2.3025851))  # ln(10)
+
+        self._init_weights(gate_bias_init)
+
+    def _init_weights(self, gate_bias_init):
+        # Identity Q/K/V initialization starts from dot-product matching in the
+        # original SigLIP embedding space instead of a fully random projection.
+        with torch.no_grad():
+            eye = torch.eye(self.embed_dim)
+            self.cross_attn.in_proj_weight.zero_()
+            self.cross_attn.in_proj_weight[:self.embed_dim].copy_(eye)
+            self.cross_attn.in_proj_weight[self.embed_dim:2 * self.embed_dim].copy_(eye)
+            self.cross_attn.in_proj_weight[2 * self.embed_dim:].copy_(eye)
+            self.cross_attn.in_proj_bias.zero_()
+            self.cross_attn.out_proj.weight.copy_(eye)
+            self.cross_attn.out_proj.bias.zero_()
+
+        # sigmoid(4) ~= 0.982: the gate initially behaves almost like identity.
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, gate_bias_init)
+
+    def forward(self, image_tokens, class_text_queries, view_logits=None,
+                num_views=1):
+        """
+        Args:
+            image_tokens: [B, S, D]
+            class_text_queries: [C, D], one cached query per class
+            view_logits: optional learnable per-view attention bias [V]
+        Returns:
+            class_logits: [B, C]
+            conditioned_queries: [B, C, D]
+        """
+        batch_size, seq_len, _ = image_tokens.shape
+        num_classes = class_text_queries.shape[0]
+
+        queries = class_text_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        normalized_queries = self.query_norm(queries)
+        normalized_images = self.image_norm(image_tokens)
+
+        attn_mask = None
+        if view_logits is not None:
+            if seq_len % num_views != 0:
+                raise ValueError(
+                    f"Image token count {seq_len} is not divisible by num_views={num_views}"
+                )
+            patches_per_view = seq_len // num_views
+            key_bias = view_logits.repeat_interleave(patches_per_view)
+            attn_mask = key_bias.unsqueeze(0).expand(num_classes, seq_len)
+
+        attended, _ = self.cross_attn(
+            query=normalized_queries,
+            key=normalized_images,
+            value=normalized_images,
+            attn_mask=attn_mask,
+            need_weights=False,
+        )
+
+        gate = torch.sigmoid(self.gate_proj(normalized_queries))
+        gated_attended = gate * attended
+        normalized_attended = self.output_norm(gated_attended)
+        conditioned = queries + normalized_attended
+
+        # Compatibility score for every image/class pair. Clamp the learned
+        # scale as done in CLIP-like models to prevent unstable logits.
+        class_logits = F.cosine_similarity(
+            F.normalize(normalized_attended, dim=-1),
+            F.normalize(queries, dim=-1),
+            dim=-1,
+        ) * self.logit_scale.exp().clamp(max=100.0)
+
+        return class_logits, conditioned
+
+
 # =============================================================================
 # Multi-View SigLIP2 Model Wrapper (V2)
 # =============================================================================
@@ -248,11 +348,24 @@ class MultiViewSigLIPModel(nn.Module):
         -> L2 normalize
     """
 
-    def __init__(self, base_model, pooler, num_views=4, embed_dim=1152):
+    def __init__(self, base_model, pooler, num_views=4, embed_dim=1152,
+                 text_fusion=None):
         super().__init__()
         self.base_model = base_model
         self.pooler = pooler
+        self.text_fusion = text_fusion or TextConditionedGatedCrossAttention(
+            embed_dim=embed_dim,
+        )
         self.num_views = num_views
+        self.class_names = []
+
+        # Filled once by set_class_prompts(). Persistent so checkpoints retain
+        # the exact frozen text queries used during training and inference.
+        self.register_buffer(
+            'class_text_queries',
+            torch.empty(0, embed_dim),
+            persistent=True,
+        )
 
         # View position embedding: [num_views, 1, D]
         # Broadcast-added to each view's 256 patch tokens
@@ -264,7 +377,79 @@ class MultiViewSigLIPModel(nn.Module):
         # Expose config for compatibility
         self.config = base_model.config
 
-    def encode_views(self, pixel_values):
+    def get_extra_state(self):
+        """Persist prompt order/text alongside tensor weights in checkpoints."""
+        return {
+            'class_names': self.class_names,
+            'resolved_class_prompts': getattr(self, 'resolved_class_prompts', {}),
+        }
+
+    def set_extra_state(self, state):
+        state = state or {}
+        self.class_names = list(state.get('class_names', []))
+        self.resolved_class_prompts = dict(state.get('resolved_class_prompts', {}))
+
+    @torch.no_grad()
+    def set_class_prompts(self, processor, class_names, class_prompts=None,
+                          max_length=64):
+        """Encode and cache candidate class prompts with frozen SigLIP text tower.
+
+        ``class_prompts`` maps a class name to either one string or several
+        prompt variants. Multiple variants are averaged into one class query.
+        Missing entries fall back to the class name and emit a warning.
+        """
+        class_prompts = class_prompts or {}
+        tokenizer = getattr(processor, 'tokenizer', processor)
+        device = next(self.base_model.parameters()).device
+        was_training = self.base_model.text_model.training
+        self.base_model.text_model.eval()
+
+        cached_queries = []
+        resolved_prompts = {}
+        for class_name in class_names:
+            prompts = class_prompts.get(class_name)
+            if prompts is None:
+                prompts = [f"an image of {class_name}"]
+                print(f"  Warning: no CLASS_PROMPTS entry for {class_name!r}; "
+                      f"using {prompts[0]!r}")
+            elif isinstance(prompts, str):
+                prompts = [prompts]
+            else:
+                prompts = list(prompts)
+
+            if not prompts or any(not str(prompt).strip() for prompt in prompts):
+                raise ValueError(f"CLASS_PROMPTS[{class_name!r}] must contain non-empty text")
+
+            tokens = tokenizer(
+                prompts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt',
+            )
+            text_outputs = self.base_model.text_model(
+                input_ids=tokens['input_ids'].to(device),
+                attention_mask=tokens.get('attention_mask', None).to(device)
+                if tokens.get('attention_mask', None) is not None else None,
+            )
+            query = F.normalize(text_outputs.pooler_output.float(), dim=-1).mean(dim=0)
+            cached_queries.append(F.normalize(query, dim=-1))
+            resolved_prompts[class_name] = prompts
+
+        self.class_text_queries = torch.stack(cached_queries).to(
+            device=device,
+            dtype=next(self.text_fusion.parameters()).dtype,
+        )
+        self.class_names = list(class_names)
+        self.resolved_class_prompts = resolved_prompts
+
+        if was_training:
+            self.base_model.text_model.train()
+
+        print(f"Cached {len(self.class_names)} class text queries in order: "
+              f"{self.class_names}")
+
+    def encode_views(self, pixel_values, return_patch_tokens=False):
         """
         Encode multi-view images and fuse into a single embedding.
 
@@ -273,10 +458,11 @@ class MultiViewSigLIPModel(nn.Module):
         Returns:
             [B, D] L2-normalized fused embedding
         """
-        # SigLIP forward (frozen, no gradient)
-        with torch.no_grad():
-            vision_outputs = self.base_model.vision_model(pixel_values=pixel_values)
-            patch_tokens = vision_outputs.last_hidden_state  # [B*V, 256, D]
+        # Most of SigLIP stays frozen, but post_layernorm is trainable.  Do not
+        # wrap this forward pass in torch.no_grad(), otherwise that LayerNorm
+        # cannot receive gradients.
+        vision_outputs = self.base_model.vision_model(pixel_values=pixel_values)
+        patch_tokens = vision_outputs.last_hidden_state  # [B*V, 256, D]
 
         B_total = patch_tokens.shape[0]
         B = B_total // self.num_views
@@ -297,7 +483,28 @@ class MultiViewSigLIPModel(nn.Module):
 
         # L2 normalize final output
         fused = fused / (fused.norm(dim=-1, keepdim=True) + 1e-12)
+        if return_patch_tokens:
+            return fused, patch_tokens
         return fused
+
+    def forward(self, pixel_values):
+        if self.class_text_queries.numel() == 0:
+            raise RuntimeError(
+                "Class text queries are not initialized. Call "
+                "model.set_class_prompts(...) before training or inference."
+            )
+
+        image_embeds, patch_tokens = self.encode_views(
+            pixel_values,
+            return_patch_tokens=True,
+        )
+        class_logits, _ = self.text_fusion(
+            image_tokens=patch_tokens,
+            class_text_queries=self.class_text_queries,
+            view_logits=self.pooler.view_logits,
+            num_views=self.num_views,
+        )
+        return image_embeds, class_logits
 
 
 # =============================================================================
@@ -332,6 +539,12 @@ def setup_multiview_model(config):
         num_views=config.NUM_VIEWS,
         view_bias_init=getattr(config, 'VIEW_BIAS_INIT', None),
     )
+    text_fusion = TextConditionedGatedCrossAttention(
+        embed_dim=embed_dim,
+        num_heads=config.TEXT_FUSION_NUM_HEADS,
+        dropout=config.TEXT_FUSION_DROPOUT,
+        gate_bias_init=config.TEXT_GATE_BIAS_INIT,
+    )
     if getattr(config, 'VIEW_BIAS_INIT', None) is not None:
         print(f"View attention bias (learnable, init): {config.VIEW_BIAS_INIT} "
               f"for views {config.VIEW_NAMES}")
@@ -341,17 +554,23 @@ def setup_multiview_model(config):
         base_model, pooler,
         num_views=config.NUM_VIEWS,
         embed_dim=embed_dim,
+        text_fusion=text_fusion,
     )
     model = model.to(config.DEVICE)
 
-    # ===== Freeze strategy: SigLIP completely frozen =====
+    # ===== Freeze strategy: SigLIP backbone frozen, output LayerNorm trainable =====
     # Freeze everything first
     for param in model.parameters():
         param.requires_grad = False
 
-    # Unfreeze trainable modules: view_pos_embed + pooler
+    # Unfreeze trainable modules: view position, image pooler, text-conditioned
+    # fusion, and the small pretrained vision output LayerNorm.
     model.view_pos_embed.requires_grad = True
     for param in model.pooler.parameters():
+        param.requires_grad = True
+    for param in model.text_fusion.parameters():
+        param.requires_grad = True
+    for param in model.base_model.vision_model.post_layernorm.parameters():
         param.requires_grad = True
 
     # Print trainable parameters
@@ -366,19 +585,34 @@ def setup_multiview_model(config):
 
     print(f"\nTotal trainable: {trainable_total:,} / Total: {total_params:,} "
           f"({100 * trainable_total / total_params:.2f}%)")
-    print(f"SigLIP: completely frozen (no gradient computation)")
+    print("SigLIP: backbone frozen; vision post_layernorm trainable")
 
-    # ===== Optimizer (single param group) =====
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-
+    # ===== Optimizer (separate LRs for new modules and pretrained LayerNorm) =====
+    pooler_params = (
+        list(model.pooler.parameters())
+        + list(model.text_fusion.parameters())
+        + [model.view_pos_embed]
+    )
+    vision_norm_params = list(model.base_model.vision_model.post_layernorm.parameters())
     optimizer = optim.AdamW(
-        trainable_params,
-        lr=config.LEARNING_RATE,
+        [
+            {
+                'params': pooler_params,
+                'lr': config.POOLER_LEARNING_RATE,
+                'name': 'multiview',
+            },
+            {
+                'params': vision_norm_params,
+                'lr': config.VISION_NORM_LEARNING_RATE,
+                'name': 'vision_post_layernorm',
+            },
+        ],
         betas=(0.9, 0.98),
         eps=1e-6,
         weight_decay=config.WEIGHT_DECAY,
     )
-    print(f"\nOptimizer: AdamW, LR={config.LEARNING_RATE:.2e}")
+    print(f"\nOptimizer: AdamW, pooler LR={config.POOLER_LEARNING_RATE:.2e}, "
+          f"vision norm LR={config.VISION_NORM_LEARNING_RATE:.2e}")
 
     # ===== Scheduler =====
     scheduler = None

@@ -3,10 +3,11 @@ SigLIP2 Multi-View Fine-tuning (V2: Patch-Level Cross-View Attention Pooling)
 ==============================================================================
 
 Architecture:
-  - SigLIP2 completely frozen (no gradient, pure feature extractor)
+  - SigLIP2 towers frozen; vision post-LayerNorm is trainable
   - Uses patch-level tokens (last_hidden_state) instead of pooler_output
   - CrossViewAttentionPooler: learnable queries cross-attend to 1024 patch tokens
-  - SupConLoss only (no text, no SigLipLoss)
+  - Frozen class-text queries cross-attend to all image patch tokens
+  - Joint SupConLoss + text-conditioned classification loss
 
 Following PaliGemma/pi0/HiROBOT pattern:
   - Freeze SigLIP, adapt downstream
@@ -17,7 +18,6 @@ Date: 2026-06-15
 """
 
 import os
-import sys
 import re
 import json
 import shutil
@@ -25,12 +25,9 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from PIL import Image
-
-# Allow launching this script from any working directory.
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, PROJECT_ROOT)
 
 from siglip2_trainer.multiview_config import MultiViewConfig
 from siglip2_trainer.multiview_models import (
@@ -42,7 +39,6 @@ from siglip2_trainer.multiview_models import (
     make_multiview_collate_fn,
     split_image_to_views,
 )
-from siglip2_trainer.multiview_video_dataset import MultiViewVideoDataset
 from siglip2_trainer.losses import SupConLoss
 from siglip2_trainer.checkpoints import CheckpointManager, EarlyStopping
 from siglip2_trainer.visualization import plot_loss_curve, save_training_summary
@@ -83,10 +79,10 @@ def compute_multiview_class_centers(model, processor, train_dataset, config, epo
         key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 0
     )
 
-    # Group samples by class. Video samples are decoded lazily by the dataset.
-    class_samples = {c: [] for c in class_list}
+    # Group image paths by class
+    class_image_paths = {c: [] for c in class_list}
     for sample in train_dataset.samples:
-        class_samples[sample['class']].append(sample)
+        class_image_paths[sample['class']].append(sample['image_path'])
 
     print(f"Classes: {len(class_list)}, Training samples: {len(train_dataset.samples)}")
 
@@ -95,32 +91,27 @@ def compute_multiview_class_centers(model, processor, train_dataset, config, epo
 
     with torch.no_grad():
         for category in class_list:
-            category_samples = class_samples[category]
-            if len(category_samples) == 0:
-                print(f"  Warning: no samples for {category}")
+            image_paths = class_image_paths[category]
+            if len(image_paths) == 0:
+                print(f"  Warning: no images for {category}")
                 continue
 
-            print(f"  Processing {category}: {len(category_samples)} samples")
+            print(f"  Processing {category}: {len(image_paths)} images")
 
             features_list = []
-            for i in range(0, len(category_samples), batch_size):
-                batch_samples = category_samples[i:i + batch_size]
+            for i in range(0, len(image_paths), batch_size):
+                batch_paths = image_paths[i:i + batch_size]
                 batch_views = []
 
-                for sample in batch_samples:
+                for img_path in batch_paths:
                     try:
-                        if 'image_path' in sample:
-                            with Image.open(sample['image_path']) as img:
-                                img = img.convert('RGB')
-                                img.load()
-                            views = split_image_to_views(img)
-                        else:
-                            views = train_dataset.load_views(
-                                sample, apply_augmentation=False
-                            )
+                        with Image.open(img_path) as img:
+                            img = img.convert('RGB')
+                            img.load()
+                        views = split_image_to_views(img)
                         batch_views.extend(views)
                     except Exception as e:
-                        print(f"    Warning: failed to load sample: {e}")
+                        print(f"    Warning: failed to load {img_path}: {e}")
                         continue
 
                 if len(batch_views) == 0:
@@ -141,8 +132,6 @@ def compute_multiview_class_centers(model, processor, train_dataset, config, epo
 
     # Save to graph_info.json
     _save_graph_info(train_dataset, class_centers, config, epoch)
-    if hasattr(train_dataset, 'close'):
-        train_dataset.close()
 
     model.train()
     return class_centers
@@ -169,13 +158,9 @@ def _save_graph_info(train_dataset, class_centers, config, epoch):
         nodes = graph_data.get('nodes', [])
         updated_count = 0
 
-        # Match node ids to class-number suffixes. Video labels can skip
-        # states, so mapping by sorted-list position would corrupt M5/M6.
-        class_by_id = {}
-        for category_name in class_centers:
-            match = re.search(r'\d+', category_name)
-            if match:
-                class_by_id[int(match.group())] = category_name
+        # Build mapping from node_id index to class name
+        # node_ids are like "001","002",... and class names are sorted
+        sorted_classes = sorted(class_centers.keys())
 
         for node in nodes:
             node_id = node.get('node_id')
@@ -188,12 +173,14 @@ def _save_graph_info(train_dataset, class_centers, config, epoch):
                 else:
                     node_id_int = int(node_id)
 
-                category_name = class_by_id.get(node_id_int)
-                if category_name is not None:
+                # Map node_id (1-based) to sorted class list index (0-based)
+                class_idx = node_id_int - 1
+                if 0 <= class_idx < len(sorted_classes):
+                    category_name = sorted_classes[class_idx]
                     node['center_feature_siglip2'] = class_centers[category_name].tolist()
                     updated_count += 1
                 else:
-                    print(f"  Warning: node {node_id} has no training samples")
+                    print(f"  Warning: node {node_id} index {node_id_int} out of range (classes: {len(sorted_classes)})")
             except Exception as e:
                 print(f"  Warning: node {node_id} processing failed: {e}")
 
@@ -242,10 +229,24 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
     print(f"Val set: {len(val_dataset)} samples, Centers: {len(class_centers)} classes")
     print(f"{'='*60}\n")
 
-    class_list = sorted(class_centers.keys())
+    class_list = list(model.class_names) if model.class_names else sorted(class_centers.keys())
+    missing_centers = [name for name in class_list if name not in class_centers]
+    if missing_centers:
+        raise ValueError(f"Missing class centers for: {missing_centers}")
     num_classes = len(class_list)
 
+    center_matrix = torch.tensor(
+        np.stack([class_centers[name] for name in class_list]),
+        dtype=torch.float32,
+        device=config.DEVICE,
+    )
+    center_matrix = F.normalize(center_matrix, dim=-1)
+    center_weight = config.CENTER_SCORE_WEIGHT
+    center_temperature = config.CENTER_SCORE_TEMPERATURE
+
     correct = 0
+    center_only_correct = 0
+    text_only_correct = 0
     total = 0
     per_class_correct = {cls: 0 for cls in class_list}
     per_class_total = {cls: 0 for cls in class_list}
@@ -274,18 +275,27 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
 
             inputs = processor(images=batch_views, return_tensors="pt")
             pixel_values = inputs['pixel_values'].to(config.DEVICE)
-            fused_embeds = model.encode_views(pixel_values)
+            fused_embeds, text_logits = model(pixel_values)
+            center_logits = F.normalize(fused_embeds, dim=-1) @ center_matrix.T
+            center_probs = F.softmax(center_logits / center_temperature, dim=-1)
+            text_probs = F.softmax(text_logits, dim=-1)
+            combined_probs = center_weight * center_probs + (1.0 - center_weight) * text_probs
 
-            for i, (vec, true_cls) in enumerate(zip(fused_embeds.cpu(), batch_true_classes)):
-                vec_np = vec.numpy()
-
-                similarities = {}
-                for cls, center in class_centers.items():
-                    similarities[cls] = float(np.dot(vec_np, center))
-
-                pred_cls = max(similarities.items(), key=lambda x: x[1])[0]
+            for i, true_cls in enumerate(batch_true_classes):
+                combined_idx = int(combined_probs[i].argmax().item())
+                center_idx = int(center_probs[i].argmax().item())
+                text_idx = int(text_probs[i].argmax().item())
+                pred_cls = class_list[combined_idx]
+                center_pred_cls = class_list[center_idx]
+                text_pred_cls = class_list[text_idx]
+                similarities = {
+                    cls: float(combined_probs[i, j].item())
+                    for j, cls in enumerate(class_list)
+                }
 
                 total += 1
+                center_only_correct += int(center_pred_cls == true_cls)
+                text_only_correct += int(text_pred_cls == true_cls)
                 per_class_total[true_cls] += 1
                 confusion_matrix[(true_cls, pred_cls)] += 1
 
@@ -318,6 +328,8 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
 
     metrics = {
         'accuracy': accuracy,
+        'center_only_accuracy': center_only_correct / total if total > 0 else 0,
+        'text_only_accuracy': text_only_correct / total if total > 0 else 0,
         'correct': correct,
         'total': total,
         'per_class_accuracy': per_class_accuracy,
@@ -325,6 +337,8 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
     }
 
     print(f"  Overall accuracy: {accuracy:.1%} ({correct}/{total})")
+    print(f"  Center-only accuracy: {metrics['center_only_accuracy']:.1%}")
+    print(f"  Text-only accuracy:   {metrics['text_only_accuracy']:.1%}")
     print(f"\n  Per-class accuracy:")
     for cls in class_list:
         acc = per_class_accuracy[cls]
@@ -369,6 +383,8 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
         'mode': 'multi-view V2 (patch-level cross-attention)',
         'metrics': {
             'accuracy': float(accuracy),
+            'center_only_accuracy': float(metrics['center_only_accuracy']),
+            'text_only_accuracy': float(metrics['text_only_accuracy']),
             'correct': int(correct),
             'total': int(total),
             'num_classes': int(num_classes),
@@ -396,8 +412,6 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
     except Exception as e:
         print(f"  Warning: confusion matrix plot failed: {e}")
 
-    if hasattr(val_dataset, 'close'):
-        val_dataset.close()
     model.train()
     print(f"{'='*60}\n")
 
@@ -420,14 +434,19 @@ def train_one_epoch(model, supcon_fn, optimizer, dataloader, epoch, config):
         pixel_values = batch['pixel_values'].to(config.DEVICE)  # [4B, C, H, W]
         labels = batch['labels'].to(config.DEVICE)
 
-        # Forward pass (SigLIP frozen inside encode_views via torch.no_grad)
-        image_embeds = model.encode_views(pixel_values)  # [B, D]
+        # Every image is scored against every cached class prompt. The label is
+        # used only by the losses, never injected as an input prompt.
+        image_embeds, class_logits = model(pixel_values)
 
-        # SupConLoss only
-        loss = supcon_fn(image_embeds, labels)
+        supcon_loss = supcon_fn(image_embeds, labels)
+        text_ce_loss = F.cross_entropy(class_logits, labels)
+        total_loss = (
+            config.SUPCON_WEIGHT * supcon_loss
+            + config.TEXT_CE_WEIGHT * text_ce_loss
+        )
 
         # Gradient accumulation
-        loss = loss / accum_steps
+        loss = total_loss / accum_steps
         loss.backward()
 
         if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
@@ -438,12 +457,13 @@ def train_one_epoch(model, supcon_fn, optimizer, dataloader, epoch, config):
             optimizer.step()
             optimizer.zero_grad()
 
-        loss_value = loss.item() * accum_steps
+        loss_value = total_loss.item()
         epoch_losses.append(loss_value)
 
         if batch_idx % 10 == 0:
             print(f"[Epoch {epoch:3d}][Batch {batch_idx:3d}] "
-                  f"SupCon: {loss_value:.4f}  LR: {current_lr:.2e}")
+                  f"Total: {loss_value:.4f}  SupCon: {supcon_loss.item():.4f}  "
+                  f"TextCE: {text_ce_loss.item():.4f}  LR: {current_lr:.2e}")
 
     return epoch_losses
 
@@ -466,7 +486,8 @@ def main():
     print(f"Query tokens:    {config.NUM_QUERY_TOKENS}")
     print(f"Pooler:          {config.POOLER_NUM_LAYERS} layers, {config.POOLER_NUM_HEADS} heads")
     print(f"Scheduler:       {config.SCHEDULER_TYPE}")
-    print(f"SigLIP:          completely frozen (patch-level tokens)")
+    print("SigLIP:          frozen towers + trainable vision post-LN")
+    print(f"Text fusion:     gated cross-attention, CE weight={config.TEXT_CE_WEIGHT}")
     print(f"Early stopping:  {config.EARLY_STOPPING}")
     if config.EARLY_STOPPING:
         print(f"  Patience:      {config.PATIENCE}")
@@ -481,67 +502,35 @@ def main():
 
     # ===== Dataset =====
     print("Loading multi-view dataset...")
-    if config.DATA_MODE == 'video':
-        video_dataset_kwargs = dict(
-            video_root=config.VIDEO_ROOT,
-            label_root=config.VIDEO_LABEL_ROOT,
-            val_ratio=config.VAL_RATIO,
-            frame_stride=config.VIDEO_FRAME_STRIDE,
-            max_samples_per_class=config.VIDEO_SAMPLES_PER_CLASS,
-        )
-        train_dataset = MultiViewVideoDataset(
-            **video_dataset_kwargs,
-            split='train',
-            use_augmentation=config.USE_AUGMENTATION,
-            augmentation_config=config.AUGMENTATION_CONFIG,
-        )
-        val_dataset = MultiViewVideoDataset(
-            **video_dataset_kwargs,
-            split='val',
-            use_augmentation=False,
-        )
-        dataset_root_for_logging = config.VIDEO_ROOT
-    elif config.DATA_MODE == 'image':
-        train_dataset = MultiViewSimpleDataset(
-            image_root=config.IMAGE_ROOT,
-            text_root=None,
-            use_augmentation=config.USE_AUGMENTATION,
-            augmentation_config=config.AUGMENTATION_CONFIG,
-            is_training=True,
-            val_ratio=config.VAL_RATIO,
-            test_ratio=0.0,
-            split='train',
-        )
-        val_dataset = MultiViewSimpleDataset(
-            image_root=config.IMAGE_ROOT,
-            text_root=None,
-            use_augmentation=False,
-            is_training=False,
-            val_ratio=config.VAL_RATIO,
-            test_ratio=0.0,
-            split='val',
-        )
-        dataset_root_for_logging = config.IMAGE_ROOT
-    else:
-        raise ValueError(f"Unsupported DATA_MODE: {config.DATA_MODE!r}")
+    train_dataset = MultiViewSimpleDataset(
+        image_root=config.IMAGE_ROOT,
+        text_root=None,
+        use_augmentation=config.USE_AUGMENTATION,
+        augmentation_config=config.AUGMENTATION_CONFIG,
+        is_training=True,
+        val_ratio=config.VAL_RATIO,
+        test_ratio=0.0,
+        split='train',
+    )
 
-    # The dataset is the source of truth for the number of trainable states.
-    train_classes = sorted(train_dataset.classes)
-    val_classes = sorted(val_dataset.classes)
-    if train_classes != val_classes:
-        raise ValueError(
-            "训练集和验证集类别不一致:\n"
-            f"  train-only: {sorted(set(train_classes) - set(val_classes))}\n"
-            f"  val-only:   {sorted(set(val_classes) - set(train_classes))}"
-        )
-    detected_num_classes = len(train_classes)
-    if getattr(config, 'NUM_CLASSES', None) != detected_num_classes:
-        print(
-            f"[Class count] 配置 NUM_CLASSES={getattr(config, 'NUM_CLASSES', None)}，"
-            f"但数据集检测到 {detected_num_classes} 个类别，自动修正。"
-        )
-        config.NUM_CLASSES = detected_num_classes
-    print(f"[Class count] 已确认 {config.NUM_CLASSES} 个状态: {train_classes}")
+    val_dataset = MultiViewSimpleDataset(
+        image_root=config.IMAGE_ROOT,
+        text_root=None,
+        use_augmentation=False,
+        is_training=False,
+        val_ratio=config.VAL_RATIO,
+        test_ratio=0.0,
+        split='val',
+    )
+
+    # Encode all candidate prompts once with the frozen SigLIP text tower.
+    # The query order exactly follows dataset.class_to_idx / integer labels.
+    model.set_class_prompts(
+        processor=processor,
+        class_names=train_dataset.classes,
+        class_prompts=config.CLASS_PROMPTS,
+        max_length=config.MAX_TEXT_LENGTH,
+    )
 
     print(f"\nDataset split:")
     print(f"  Train: {len(train_dataset)} samples")
@@ -565,7 +554,7 @@ def main():
 
     # ===== Save training config =====
     print("Collecting training configuration...")
-    dataset_info = collect_dataset_info(train_dataset, dataset_root_for_logging, None)
+    dataset_info = collect_dataset_info(train_dataset, config.IMAGE_ROOT, None)
     dataset_info['mode'] = 'multi-view V2 (patch-level cross-attention)'
     dataset_info['views_per_sample'] = config.NUM_VIEWS
     model_info = collect_model_info(model)
@@ -592,9 +581,6 @@ def main():
     # ===== Resume from checkpoint =====
     start_epoch = 0
     best_loss = float('inf')
-    best_loss_epoch = None
-    best_eval_accuracy = None
-    best_eval_epoch = None
 
     if config.RESUME_FROM_CHECKPOINT:
         try:
@@ -643,7 +629,6 @@ def main():
         is_best = avg_loss < best_loss
         if is_best:
             best_loss = avg_loss
-            best_loss_epoch = epoch
             best_loss_updated = True
             checkpoint_manager.save_best_loss(model, optimizer, epoch, avg_loss, current_lr, scheduler)
 
@@ -703,11 +688,6 @@ def main():
                 accuracy_history.append(metrics['accuracy'])
                 accuracy_epochs.append(epoch)
 
-                if (best_eval_accuracy is None or
-                        metrics['accuracy'] > best_eval_accuracy + config.MIN_DELTA):
-                    best_eval_accuracy = metrics['accuracy']
-                    best_eval_epoch = epoch
-
                 if early_stopping is not None:
                     should_stop = early_stopping(metrics['accuracy'], epoch)
                     if should_stop:
@@ -743,11 +723,9 @@ def main():
     print(f"Total time:   {elapsed:.2f}s ({elapsed/60:.2f} min)")
     print(f"Total epochs: {epoch + 1}")
     print(f"Best loss:    {best_loss:.4f}")
-    print(f"Best loss epoch: {best_loss_epoch}")
     print(f"Final loss:   {loss_history[-1]:.4f}")
     if accuracy_history:
         print(f"Best accuracy: {max(accuracy_history):.2%}")
-        print(f"Best accuracy epoch: {best_eval_epoch}")
         print(f"Final accuracy: {accuracy_history[-1]:.2%}")
     print("=" * 60)
     print(f"\nSaved checkpoints: {checkpoint_manager.get_saved_epochs()}")
@@ -761,7 +739,7 @@ def main():
     if os.path.exists(best_loss_path):
         print(f"\nProcessing graph_info_best_loss.json...")
         try:
-            checkpoint = torch.load(best_loss_path, map_location='cpu', weights_only=False)
+            checkpoint = torch.load(best_loss_path, map_location='cpu')
             model.load_state_dict(checkpoint['model_state_dict'])
             model.to(config.DEVICE)
             print(f"  Loaded: epoch={checkpoint['epoch']}, loss={checkpoint['loss']:.4f}")
@@ -776,7 +754,7 @@ def main():
     if os.path.exists(best_eval_path) and accuracy_history:
         print(f"\nProcessing graph_info_best_eval.json...")
         try:
-            checkpoint = torch.load(best_eval_path, map_location='cpu', weights_only=False)
+            checkpoint = torch.load(best_eval_path, map_location='cpu')
             model.load_state_dict(checkpoint['model_state_dict'])
             model.to(config.DEVICE)
             print(f"  Loaded: epoch={checkpoint['epoch']}, accuracy={checkpoint['eval_accuracy']:.2%}")
