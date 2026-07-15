@@ -20,8 +20,8 @@ class MultiViewConfig:
 
     # === Early stopping ===
     EARLY_STOPPING = True
-    PATIENCE       = 5
-    MIN_DELTA      = 1e-4
+    PATIENCE       = 3
+    MIN_DELTA      = 1e-3
 
     # === Data split ===
     VAL_RATIO           = 0.2

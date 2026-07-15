@@ -66,16 +66,16 @@ def parse_args():
                         default=None,
                         help='标签根目录；为空时在视频所在目录查找')
     parser.add_argument('--save_dir', type=str,
-                        default="/home/liuqian/Aqcy/0714_m6/cube_result",
+                        default="/home/liuqian/Aqcy/train_result_0715",
                         help='所有测试结果的保存根目录, 自动创建子目录(保留原始子目录结构)')
     parser.add_argument('--graph_info', type=str,
                         default="/home/liuqian/Aqcy/train_cuberesult_0714/gift_cube_0714/classification_viz/graph_info_best_eval.json",
                         help='graph_info.json 路径')
     parser.add_argument('--image_root', type=str,
-                        default="/home/liuqian/Aqcy/gift_m6_picture_train40_mult_0710",
+                        default="/home/liuqian/Aqcy/siglip2_train/gift_m6_picture_train40_mult_0630",
                         help='训练图片根目录 (用于计算缺失的类中心)')
     parser.add_argument('--base_model', type=str,
-                        default="/home/liuqian/Aqcy/qcy/siglip2-so400m-patch14-224",
+                        default="/home/liuqian/Aqcy/siglip2_train/siglip2-so400m-patch14-224",
                         help='SigLIP2 base model 路径')
     parser.add_argument('--model_checkpoint', type=str,
                         default="/home/liuqian/Aqcy/train_cuberesult_0714/gift_cube_0714/model_siglip2_multiview_v2_best_eval.pt",
@@ -97,8 +97,8 @@ def parse_args():
     # EMA 平滑
     parser.add_argument('--no_sim_ema', action='store_true',
                         help='禁用相似度空间 EMA 平滑 (默认启用)')
-    parser.add_argument('--ema_beta', type=float, default=0.3,
-                        help='EMA 系数: 0=无平滑, 越大越平滑')
+    parser.add_argument('--ema_beta', type=float, default=0.7,
+                        help='EMA 系数: 0=无平滑, 越大越平滑 (默认: 0.7)')
 
     # 其他
     parser.add_argument('--dim_reduction', type=str, default='pca', choices=['pca', 'tsne'],
@@ -624,6 +624,10 @@ def save_accuracy_report(accuracy, correct_count, total_count, confusion_matrix,
         f.write("=" * 60 + "\n")
         f.write("准确率分析报告 (SigLIP2 Multi-View)\n")
         f.write("=" * 60 + "\n\n")
+        f.write(f"相似度 EMA: {'启用' if USE_SIM_EMA else '关闭'}\n")
+        if USE_SIM_EMA:
+            f.write(f"EMA beta: {EMA_BETA:.4f}\n")
+        f.write("\n")
         f.write(f"总体准确率: {accuracy:.2f}%\n")
         f.write(f"正确预测: {correct_count}/{total_count} 帧\n")
         f.write(f"错误预测: {total_count - correct_count} 帧\n\n")
@@ -1507,6 +1511,9 @@ def run_video_mode(model, model_type, processor, video_dir, category_description
         f.write("SigLIP2 Multi-View 批量测试汇总报告\n")
         f.write(f"视频根目录: {video_dir}\n")
         f.write(f"测试视频数: {len(summary_records)}\n")
+        f.write(f"相似度 EMA: {'启用' if USE_SIM_EMA else '关闭'}\n")
+        if USE_SIM_EMA:
+            f.write(f"EMA beta: {EMA_BETA:.4f}\n")
         f.write("=" * 80 + "\n\n")
 
         f.write(f"{'子目录':<25} {'视频名':<20} {'帧数':>6}  {'准确率':>8}  {'正确/总帧':>12}  "
