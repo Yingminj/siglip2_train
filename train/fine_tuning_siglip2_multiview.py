@@ -42,7 +42,10 @@ from siglip2_trainer.multiview_models import (
     make_multiview_collate_fn,
     split_image_to_views,
 )
-from siglip2_trainer.multiview_video_dataset import MultiViewVideoDataset
+from siglip2_trainer.multiview_video_dataset import (
+    MultiViewClassFolderVideoDataset,
+    MultiViewVideoDataset,
+)
 from siglip2_trainer.losses import SupConLoss
 from siglip2_trainer.checkpoints import CheckpointManager, EarlyStopping
 from siglip2_trainer.visualization import (
@@ -154,7 +157,9 @@ def compute_multiview_class_centers(model, processor, train_dataset, config, epo
 
 def _save_graph_info(train_dataset, class_centers, config, epoch):
     """Copy and update graph_info.json with computed class centers."""
-    original_graph_path = os.path.join(train_dataset.image_root, "graph_info.json")
+    original_graph_path = getattr(config, 'GRAPH_INFO_PATH', None)
+    if not original_graph_path:
+        original_graph_path = os.path.join(train_dataset.image_root, "graph_info.json")
 
     if not os.path.exists(original_graph_path):
         print(f"  Warning: graph_info.json not found at {original_graph_path}")
@@ -628,7 +633,26 @@ def main():
 
     # ===== Dataset =====
     print("Loading multi-view dataset...")
-    if config.DATA_MODE == 'video':
+    test_dataset = None
+    if config.DATA_MODE == 'video_class_folders':
+        class_folder_kwargs = dict(
+            split_root=config.VIDEO_DATA_ROOT,
+            frames_per_video=config.VIDEO_FRAMES_PER_VIDEO,
+        )
+        train_dataset = MultiViewClassFolderVideoDataset(
+            **class_folder_kwargs,
+            split='train',
+            use_augmentation=config.USE_AUGMENTATION,
+            augmentation_config=config.AUGMENTATION_CONFIG,
+        )
+        val_dataset = MultiViewClassFolderVideoDataset(
+            **class_folder_kwargs, split='val', use_augmentation=False,
+        )
+        test_dataset = MultiViewClassFolderVideoDataset(
+            **class_folder_kwargs, split='test', use_augmentation=False,
+        )
+        dataset_root_for_logging = config.VIDEO_DATA_ROOT
+    elif config.DATA_MODE == 'video':
         video_dataset_kwargs = dict(
             video_root=config.VIDEO_ROOT,
             label_root=config.VIDEO_LABEL_ROOT,
@@ -681,6 +705,14 @@ def main():
             f"  train-only: {sorted(set(train_classes) - set(val_classes))}\n"
             f"  val-only:   {sorted(set(val_classes) - set(train_classes))}"
         )
+    if test_dataset is not None:
+        test_classes = sorted(test_dataset.classes)
+        if train_classes != test_classes:
+            raise ValueError(
+                "训练集和测试集类别不一致:\n"
+                f"  train-only: {sorted(set(train_classes) - set(test_classes))}\n"
+                f"  test-only:  {sorted(set(test_classes) - set(train_classes))}"
+            )
     detected_num_classes = len(train_classes)
     if getattr(config, 'NUM_CLASSES', None) != detected_num_classes:
         print(
@@ -693,7 +725,12 @@ def main():
     print(f"\nDataset split:")
     print(f"  Train: {len(train_dataset)} samples")
     print(f"  Val:   {len(val_dataset)} samples")
-    print(f"  Split: train {1-config.VAL_RATIO:.0%} / val {config.VAL_RATIO:.0%}")
+    if test_dataset is not None:
+        print(f"  Test:  {len(test_dataset)} samples "
+              "(held out; not used for model selection)")
+        print("  Split: predefined train / val / test directories")
+    else:
+        print(f"  Split: train {1-config.VAL_RATIO:.0%} / val {config.VAL_RATIO:.0%}")
     print(f"  Eval interval: every {config.EVAL_EVERY_N_EPOCHS} epochs")
     print()
 

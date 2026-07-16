@@ -40,9 +40,9 @@ class MultiViewConfig:
 
     # === Multi-View specific ===
     NUM_VIEWS = 3
-    VIEW_NAMES = ['head','wrist_left', 'wrist_right']
-    # 每个视角的注意力先验权重(logit 空间, 与 VIEW_NAMES 顺序一致, index 0=head).
-    # 可学习, 仅作初始化先验. head=+1.0 表示头部初始注意力质量约为腕部的 e^1≈2.7 倍.
+    VIEW_NAMES = ['center', 'left', 'right']
+    # 每个视角的注意力先验权重(logit 空间, 与 VIEW_NAMES 顺序一致, index 0=center).
+    # 可学习, 仅作初始化先验. center=+1.0 表示中间视角初始注意力质量约为侧视角的 e^1≈2.7 倍.
     # 设为 None 则关闭先验(初始化为全 0, 仍可学习).
     VIEW_BIAS_INIT = None
 
@@ -53,17 +53,22 @@ class MultiViewConfig:
     POOLER_DROPOUT     = 0.1
 
     # === Data paths ===
-    # "image": class folders; "video": MP4 files with frame-level TXT labels.
-    DATA_MODE = "image"
+    # "image": image class folders.
+    # "video": MP4 files with frame-level TXT labels.
+    # "video_class_folders": predefined train/val/test/M1...M6 directories.
+    DATA_MODE = "video_class_folders"
     IMAGE_ROOT = "/home/liuqian/Aqcy/gift_m6_picture_train40_mult_0630"
+    VIDEO_DATA_ROOT = "/home/liuqian/Aqcy/0716_3view_rosbag"
+    VIDEO_FRAMES_PER_VIDEO = 24
+    GRAPH_INFO_PATH = "/home/liuqian/Aqcy/gift_m6_picture_train40_mult_0630/graph_info.json"
     VIDEO_ROOT = "/home/liuqian/Aqcy/cube_data/cubedata_multiviewer_0713"
     VIDEO_LABEL_ROOT = "/home/liuqian/Aqcy/cube_data/cubedata_multiviewer_0713_label"
     VIDEO_FRAME_STRIDE = 5       # 1=每帧；5=每 5 帧采一帧
     VIDEO_SAMPLES_PER_CLASS = 1000  # 每状态总数；按 VAL_RATIO 分为 800/200
 
     # === Save paths ===
-    MODEL_DIR  = "/home/liuqian/Aqcy/train_result_0714/gift_1"
-    MODEL_NAME = "model_siglip2_multiview_v2"
+    MODEL_DIR  = "/home/liuqian/Aqcy/train_giftvedio_0716/trainresult_0716_3view_rosbag"
+    MODEL_NAME = "baseline"
 
     # === Resume ===
     RESUME_FROM_CHECKPOINT = ""

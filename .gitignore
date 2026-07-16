@@ -1,4 +1,8 @@
+# Python bytecode and interpreter caches (all directories)
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
 
 siglip2-so400m-patch14-224/model.safetensors

@@ -12,6 +12,129 @@ from .augmentation import SigLIPAugmentation
 from .multiview_models import split_image_to_views
 
 
+class MultiViewClassFolderVideoDataset(Dataset):
+    """Read uniformly sampled frames from ``split/class/*.mp4`` folders.
+
+    The train/val/test split is defined by directories, so frames from one
+    video can never leak into another split.  A fixed number of frames is used
+    per video to stop longer states from dominating training.
+    """
+
+    def __init__(self, split_root, split="train", frames_per_video=16,
+                 use_augmentation=False, augmentation_config=None,
+                 edge_fraction=0.05, max_open_videos=8):
+        self.split_root = Path(split_root).expanduser().resolve()
+        self.image_root = str(self.split_root)
+        self.split = split
+        self.frames_per_video = int(frames_per_video)
+        self.max_open_videos = max_open_videos
+        self._captures = OrderedDict()
+        if self.frames_per_video < 1:
+            raise ValueError("frames_per_video must be >= 1")
+        if not 0 <= edge_fraction < 0.5:
+            raise ValueError("edge_fraction must be in [0, 0.5)")
+
+        split_dir = self.split_root / split
+        if not split_dir.is_dir():
+            raise FileNotFoundError(f"split directory does not exist: {split_dir}")
+        class_dirs = [path for path in split_dir.iterdir() if path.is_dir()]
+        class_dirs.sort(
+            key=lambda path: (
+                0, int(path.name[1:])
+            ) if path.name.startswith("M") and path.name[1:].isdigit()
+            else (1, path.name)
+        )
+        if not class_dirs:
+            raise RuntimeError(f"no class directories in {split_dir}")
+
+        self.classes = [path.name for path in class_dirs]
+        self.class_to_idx = {name: index for index, name in enumerate(self.classes)}
+        self.augment_fn = None
+        if use_augmentation and augmentation_config:
+            self.augment_fn = SigLIPAugmentation(
+                is_training=True, augment_config=augmentation_config
+            )
+
+        self.samples = []
+        for class_dir in class_dirs:
+            for video_path in sorted(class_dir.glob("*.mp4")):
+                capture = cv2.VideoCapture(str(video_path))
+                frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+                capture.release()
+                if frame_count < 1:
+                    print(f"Warning: skipping unreadable video {video_path}")
+                    continue
+                first = int(frame_count * edge_fraction)
+                last = max(first, frame_count - 1 - first)
+                indices = [
+                    round(first + i * (last - first) /
+                          max(1, self.frames_per_video - 1))
+                    for i in range(self.frames_per_video)
+                ]
+                for frame_idx in indices:
+                    self.samples.append({
+                        "class": class_dir.name,
+                        "label": self.class_to_idx[class_dir.name],
+                        "video_path": str(video_path),
+                        "frame_idx": int(frame_idx),
+                    })
+
+        if not self.samples:
+            raise RuntimeError(f"no readable videos in {split_dir}")
+        self.video_count = len({sample["video_path"] for sample in self.samples})
+        print(
+            f"MultiViewClassFolderVideoDataset ({split}): {len(self.samples)} "
+            f"frames from {self.video_count} videos, "
+            f"{self.frames_per_video} frames/video, classes={self.classes}"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _get_capture(self, video_path):
+        capture = self._captures.pop(video_path, None)
+        if capture is None or not capture.isOpened():
+            capture = cv2.VideoCapture(video_path)
+            if not capture.isOpened():
+                raise RuntimeError(f"cannot open video: {video_path}")
+        self._captures[video_path] = capture
+        while len(self._captures) > self.max_open_videos:
+            _, old_capture = self._captures.popitem(last=False)
+            old_capture.release()
+        return capture
+
+    def load_views(self, sample, apply_augmentation=False):
+        capture = self._get_capture(sample["video_path"])
+        capture.set(cv2.CAP_PROP_POS_FRAMES, sample["frame_idx"])
+        ok, frame = capture.read()
+        if not ok:
+            raise RuntimeError(
+                f"failed reading {sample['video_path']} frame={sample['frame_idx']}"
+            )
+        image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        views = split_image_to_views(image)
+        if apply_augmentation and self.augment_fn is not None:
+            views = [self.augment_fn(view) for view in views]
+        return views
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        return {
+            "views": self.load_views(sample, apply_augmentation=True),
+            "label": sample["label"],
+            "class": sample["class"],
+        }
+
+    def close(self):
+        for capture in self._captures.values():
+            capture.release()
+        self._captures.clear()
+
+    def __del__(self):
+        if hasattr(self, "_captures"):
+            self.close()
+
+
 class MultiViewVideoDataset(Dataset):
     """Read labelled frames from horizontal three-view MP4 files.
 
