@@ -60,16 +60,16 @@ def parse_args():
         description='SigLIP2 Multi-View 视频帧分类测试 (递归扫描版)'
     )
     parser.add_argument('--video_dir', type=str,
-                        default="/home/liuqian/Aqcy/vedio_box",
-                        help='递归扫描该目录下所有子目录中的 mp4+标注配对')
+                        default="/home/liuqian/Aqcy/0716_3view_rosbag/test",
+                        help='递归扫描 mp4；支持同名标注或 M1...M6 类别文件夹')
     parser.add_argument('--label_dir', type=str,
                         default=None,
                         help='标签根目录；为空时在视频所在目录查找')
     parser.add_argument('--save_dir', type=str,
-                        default="/home/liuqian/Aqcy/train_result_0715",
+                        default="/home/liuqian/Aqcy/train_giftvedio_0716/testresult_0716_base_ema0.7",
                         help='所有测试结果的保存根目录, 自动创建子目录(保留原始子目录结构)')
     parser.add_argument('--graph_info', type=str,
-                        default="/home/liuqian/Aqcy/train_cuberesult_0714/gift_cube_0714/classification_viz/graph_info_best_eval.json",
+                        default="/home/liuqian/Aqcy/train_giftvedio_0716/trainresult_0716_3view_rosbag/classification_viz/graph_info_best_eval.json",
                         help='graph_info.json 路径')
     parser.add_argument('--image_root', type=str,
                         default="/home/liuqian/Aqcy/siglip2_train/gift_m6_picture_train40_mult_0630",
@@ -78,7 +78,7 @@ def parse_args():
                         default="/home/liuqian/Aqcy/siglip2_train/siglip2-so400m-patch14-224",
                         help='SigLIP2 base model 路径')
     parser.add_argument('--model_checkpoint', type=str,
-                        default="/home/liuqian/Aqcy/train_cuberesult_0714/gift_cube_0714/model_siglip2_multiview_v2_best_eval.pt",
+                        default="/home/liuqian/Aqcy/train_giftvedio_0716/trainresult_0716_3view_rosbag/baseline_best_eval.pt",
                         help='MultiViewSigLIPModel checkpoint 路径 (为空则使用预训练 base)')
     parser.add_argument('--use_pretrained', action='store_true',
                         help='使用预训练 base model, 不加载训练好的 pooler 权重')
@@ -1290,6 +1290,10 @@ def find_video_label_pairs(video_dir, label_dir=None):
                 pairs.append((os.path.join(dirpath, fname), json_label, rel_subdir))
             elif os.path.exists(txt_label):
                 pairs.append((os.path.join(dirpath, fname), txt_label, rel_subdir))
+            elif re.fullmatch(r'M\d+', os.path.basename(dirpath)):
+                # In a segmented class-folder dataset, the folder name is the
+                # ground-truth state for the complete video.
+                pairs.append((os.path.join(dirpath, fname), None, rel_subdir))
             else:
                 print(f"  警告: 未找到 {fname} 对应的标注文件, 跳过")
     return pairs
@@ -1306,7 +1310,8 @@ def run_video_mode(model, model_type, processor, video_dir, category_description
     video_pairs = find_video_label_pairs(video_dir, label_dir)
     print(f"\n发现 {len(video_pairs)} 个视频-标注配对:")
     for vp, lp, rel in video_pairs:
-        print(f"  [{rel}] {os.path.basename(vp)}  ->  {os.path.basename(lp)}")
+        label_desc = os.path.basename(lp) if lp else '类别文件夹标签'
+        print(f"  [{rel}] {os.path.basename(vp)}  ->  {label_desc}")
 
     summary_records = []
 
@@ -1322,7 +1327,14 @@ def run_video_mode(model, model_type, processor, video_dir, category_description
         print(f"处理视频: {video_name}")
         print(f"{'=' * 60}")
 
-        gt_dict, gt_exists = load_ground_truth_labels(label_path)
+        folder_class_name = None
+        if label_path is None:
+            parent_name = os.path.basename(os.path.dirname(video_path))
+            if re.fullmatch(r'M\d+', parent_name):
+                folder_class_name = parent_name
+            gt_dict, gt_exists = None, False
+        else:
+            gt_dict, gt_exists = load_ground_truth_labels(label_path)
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -1334,6 +1346,16 @@ def run_video_mode(model, model_type, processor, video_dir, category_description
         if video_fps <= 0:
             video_fps = 30.0
         print(f"  视频信息: {total_frames} 帧, {video_fps:.1f} FPS")
+
+        if folder_class_name is not None:
+            if folder_class_name not in category_to_idx:
+                print(f"  警告: 类别 {folder_class_name} 不在 graph_info 类别中")
+                cap.release()
+                continue
+            gt_idx = category_to_idx[folder_class_name]
+            gt_dict = {frame: gt_idx for frame in range(total_frames)}
+            gt_exists = True
+            print(f"  类别文件夹 Ground Truth: {folder_class_name}（整段视频）")
 
         gt_data = []
         if gt_exists:
