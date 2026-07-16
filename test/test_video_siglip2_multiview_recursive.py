@@ -66,23 +66,28 @@ def parse_args():
                         default=None,
                         help='标签根目录；为空时在视频所在目录查找')
     parser.add_argument('--save_dir', type=str,
-                        default="/home/liuqian/Aqcy/0714_m6/cube_result",
+                        default="/home/liuqian/Aqcy/train0630_result_0716/test_716_lga_ema7_bias3",
                         help='所有测试结果的保存根目录, 自动创建子目录(保留原始子目录结构)')
     parser.add_argument('--graph_info', type=str,
-                        default="/home/liuqian/Aqcy/train_cuberesult_0714/gift_cube_0714/classification_viz/graph_info_best_eval.json",
+                        default="/home/liuqian/Aqcy/train0630_result_0716/trainresult_gifbox_0630_learnable_gate/classification_viz/graph_info_14.json",
                         help='graph_info.json 路径')
     parser.add_argument('--image_root', type=str,
-                        default="/home/liuqian/Aqcy/gift_m6_picture_train40_mult_0710",
+                        default="/home/liuqian/Aqcy/gift_m6_picture_train40_mult_0630",
                         help='训练图片根目录 (用于计算缺失的类中心)')
     parser.add_argument('--base_model', type=str,
-                        default="/home/liuqian/Aqcy/qcy/siglip2-so400m-patch14-224",
+                        default="/home/liuqian/Aqcy/siglip2_train/siglip2-so400m-patch14-224",
                         help='SigLIP2 base model 路径')
     parser.add_argument('--model_checkpoint', type=str,
-                        default="/home/liuqian/Aqcy/train_cuberesult_0714/gift_cube_0714/model_siglip2_multiview_v2_best_eval.pt",
+                        default="/home/liuqian/Aqcy/train0630_result_0716/trainresult_gifbox_0630_learnable_gate/model_siglip2_multiview_v2_best_eval.pt",
                         help='MultiViewSigLIPModel checkpoint 路径 (为空则使用预训练 base)')
     parser.add_argument('--use_pretrained', action='store_true',
                         help='使用预训练 base model, 不加载训练好的 pooler 权重')
-
+    parser.add_argument('--view1_bias_delta', type=float, default=0.0,
+                        help='测试时额外增加 View 1 的全局 attention bias；0 表示不修改 checkpoint')
+    parser.add_argument('--view2_bias_delta', type=float, default=0.0,
+                        help='测试时额外增加 View 2 的全局 attention bias；0 表示不修改 checkpoint')
+    parser.add_argument('--view3_bias_delta', type=float, default=0.0,
+                        help='测试时额外增加 View 3 的全局 attention bias；0 表示不修改 checkpoint')
     # 多视角模型配置 (必须与训练时一致)
     parser.add_argument('--num_views', type=int, default=3,
                         help='视角数 (由 split_image_to_views 自动推断时此值仅作校验)')
@@ -98,7 +103,15 @@ def parse_args():
     parser.add_argument('--no_sim_ema', action='store_true',
                         help='禁用相似度空间 EMA 平滑 (默认启用)')
     parser.add_argument('--ema_beta', type=float, default=0.3,
-                        help='EMA 系数: 0=无平滑, 越大越平滑')
+                        help='EMA 系数: 0=无平滑, 越大越平滑 (默认: 0.7)')
+
+    # Gate attention 与类别中心融合（与训练验证保持一致）
+    parser.add_argument('--no_gate_fusion', action='store_true',
+                        help='禁用类别 query gate 分数，仅使用类别中心相似度')
+    parser.add_argument('--center_score_weight', type=float, default=0.7,
+                        help='融合时类别中心概率的权重 (默认: 0.7)')
+    parser.add_argument('--center_score_temperature', type=float, default=0.1,
+                        help='类别中心余弦相似度的 softmax 温度 (默认: 0.1)')
 
     # 其他
     parser.add_argument('--dim_reduction', type=str, default='pca', choices=['pca', 'tsne'],
@@ -130,7 +143,16 @@ FEATURE_KEY = args.feature_key
 BACKGROUND_MASK_RATIO = args.background_mask_ratio
 USE_SIM_EMA = not args.no_sim_ema
 EMA_BETA = args.ema_beta
+USE_GATE_FUSION = not args.no_gate_fusion
+CENTER_SCORE_WEIGHT = args.center_score_weight
+CENTER_SCORE_TEMPERATURE = args.center_score_temperature
+ACTIVE_GATE_FUSION = False
 DIMENSION_REDUCTION_METHOD = args.dim_reduction
+
+if not 0.0 <= CENTER_SCORE_WEIGHT <= 1.0:
+    raise ValueError('--center_score_weight 必须位于 [0, 1]')
+if CENTER_SCORE_TEMPERATURE <= 0.0:
+    raise ValueError('--center_score_temperature 必须大于 0')
 
 # 轨迹/实时显示配置 (默认关闭窗口)
 TRAJECTORY_COLOR = (255, 140, 0)
@@ -165,11 +187,24 @@ def load_model():
         has_base_model_prefix = any(k.startswith('base_model.') for k in state_dict)
         has_pooler = any(k.startswith('pooler.') for k in state_dict)
         has_view_pos_embed = 'view_pos_embed' in state_dict
+        has_text_fusion = any(k.startswith('text_fusion.') for k in state_dict)
+        cached_text_queries = state_dict.get('class_text_queries')
+        has_cached_text_queries = (
+            isinstance(cached_text_queries, torch.Tensor)
+            and cached_text_queries.numel() > 0
+        )
 
         if has_base_model_prefix and has_pooler and has_view_pos_embed:
             # --- MultiView 模型 ---
             num_queries = state_dict['pooler.query_tokens'].shape[1]
-            num_layers = sum(1 for k in state_dict if k.endswith('.cross_attn.in_proj_weight'))
+            # Gate checkpoint 也含有 text_fusion.cross_attn；这里只统计图像 pooler。
+            num_layers = sum(
+                1 for k in state_dict
+                if k.startswith('pooler.layers.')
+                and k.endswith('.cross_attn.in_proj_weight')
+            )
+            if num_layers == 0:
+                num_layers = args.pooler_num_layers
             num_views = state_dict['view_pos_embed'].shape[0]
 
             pooler = CrossViewAttentionPooler(
@@ -177,9 +212,22 @@ def load_model():
                 num_heads=args.pooler_num_heads, num_layers=num_layers, dropout=0.0)
             model = MultiViewSigLIPModel(
                 base_model, pooler, num_views=num_views, embed_dim=embed_dim)
-            model.load_state_dict(state_dict)
+            # Persistent class queries have checkpoint-dependent shape. Resize
+            # the initially empty buffer before loading to avoid a shape error.
+            if has_cached_text_queries:
+                model.class_text_queries = torch.empty_like(cached_text_queries)
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            model.gate_inference_available = bool(
+                has_text_fusion and has_cached_text_queries
+            )
             model_type = 'multiview'
             print(f"  ✓ MultiView 模型 (views={num_views}, queries={num_queries}, layers={num_layers})")
+            if model.gate_inference_available:
+                print(f"  ✓ Gate attention 可用 (classes={cached_text_queries.shape[0]})")
+            else:
+                print("  ℹ 旧版/无类别 query checkpoint，推理将使用类别中心")
+            if has_text_fusion and incompatible.unexpected_keys:
+                print(f"  警告: checkpoint 中有未识别参数: {incompatible.unexpected_keys}")
 
         elif has_base_model_prefix and has_pooler and not has_view_pos_embed:
             # --- SingleView V2 模型 ---
@@ -191,6 +239,7 @@ def load_model():
                 num_heads=args.pooler_num_heads, num_layers=num_layers, dropout=0.0)
             model = SingleViewSigLIPModel(base_model, pooler, embed_dim=embed_dim)
             model.load_state_dict(state_dict)
+            model.gate_inference_available = False
             model_type = 'singleview_v2'
             print(f"  ✓ SingleView V2 模型 (queries={num_queries}, layers={num_layers})")
 
@@ -202,6 +251,7 @@ def load_model():
             base_model.load_state_dict(state_dict, strict=False)
             model = base_model
             model_type = 'base'
+            model.gate_inference_available = False
             print("  ✓ 基础 SigLIP 模型")
 
         if 'epoch' in checkpoint:
@@ -217,9 +267,12 @@ def load_model():
             print(f"⚠ 未找到 checkpoint: {CHECKPOINT_PATH}, 使用预训练 base model")
         model = base_model
         model_type = 'base'
+        model.gate_inference_available = False
 
     model = model.to(DEVICE)
     model.eval()
+    if not hasattr(model, 'gate_inference_available'):
+        model.gate_inference_available = False
     print(f"  模型类型: {model_type}")
     print("=" * 60)
     return model, processor, model_type
@@ -470,6 +523,38 @@ def find_nearest_category(feature_vector, category_centers, category_description
     return nearest_category, max_similarity, all_similarities
 
 
+def fuse_center_and_gate_scores(center_similarities, text_logits):
+    """Fuse center and gated-text probabilities exactly as in validation."""
+    categories = list(center_similarities.keys())
+    center_logits = np.asarray(
+        [center_similarities[category] for category in categories],
+        dtype=np.float32,
+    ) / CENTER_SCORE_TEMPERATURE
+    text_logits = np.asarray(text_logits, dtype=np.float32)
+    if text_logits.shape != center_logits.shape:
+        raise ValueError(
+            f"Gate 类别数 {text_logits.size} 与图中心类别数 "
+            f"{center_logits.size} 不一致"
+        )
+
+    center_logits -= center_logits.max()
+    text_logits -= text_logits.max()
+    center_probs = np.exp(center_logits)
+    center_probs /= center_probs.sum()
+    text_probs = np.exp(text_logits)
+    text_probs /= text_probs.sum()
+    combined_probs = (
+        CENTER_SCORE_WEIGHT * center_probs
+        + (1.0 - CENTER_SCORE_WEIGHT) * text_probs
+    )
+    scores = {
+        category: float(combined_probs[index])
+        for index, category in enumerate(categories)
+    }
+    best_index = int(combined_probs.argmax())
+    return categories[best_index], float(combined_probs[best_index]), scores
+
+
 def load_ground_truth_labels(label_path):
     """
     加载 Ground Truth 标注, 支持:
@@ -624,6 +709,15 @@ def save_accuracy_report(accuracy, correct_count, total_count, confusion_matrix,
         f.write("=" * 60 + "\n")
         f.write("准确率分析报告 (SigLIP2 Multi-View)\n")
         f.write("=" * 60 + "\n\n")
+        f.write(f"Gate 融合: {'启用' if ACTIVE_GATE_FUSION else '关闭'}\n")
+        if ACTIVE_GATE_FUSION:
+            f.write(f"中心/Gate权重: {CENTER_SCORE_WEIGHT:.4f} / "
+                    f"{1.0 - CENTER_SCORE_WEIGHT:.4f}\n")
+            f.write(f"中心分数温度: {CENTER_SCORE_TEMPERATURE:.4f}\n")
+        f.write(f"相似度 EMA: {'启用' if USE_SIM_EMA else '关闭'}\n")
+        if USE_SIM_EMA:
+            f.write(f"EMA beta: {EMA_BETA:.4f}\n")
+        f.write("\n")
         f.write(f"总体准确率: {accuracy:.2f}%\n")
         f.write(f"正确预测: {correct_count}/{total_count} 帧\n")
         f.write(f"错误预测: {total_count - correct_count} 帧\n\n")
@@ -1204,6 +1298,7 @@ def encode_frame(model, model_type, processor, pil_image):
 
     Returns:
         feature: numpy array [D]
+        text_logits: optional numpy array [C] from gated text attention
     """
     multiview_input = is_multiview_image(pil_image)
 
@@ -1213,8 +1308,13 @@ def encode_frame(model, model_type, processor, pil_image):
         inputs = processor(images=views, return_tensors="pt")
         pixel_values = inputs['pixel_values'].to(DEVICE)
         with torch.no_grad():
-            fused = model.encode_views(pixel_values)  # [1, D]
-        return fused[0].cpu().numpy().astype(np.float32)
+            if USE_GATE_FUSION and getattr(model, 'gate_inference_available', False):
+                fused, text_logits = model(pixel_values)
+                text_logits = text_logits[0].cpu().numpy().astype(np.float32)
+            else:
+                fused = model.encode_views(pixel_values)  # [1, D]
+                text_logits = None
+        return fused[0].cpu().numpy().astype(np.float32), text_logits
 
     elif not multiview_input and model_type in ('singleview_v2', 'base'):
         # 单视角路径
@@ -1227,7 +1327,7 @@ def encode_frame(model, model_type, processor, pil_image):
                 vision_out = model.vision_model(pixel_values=pixel_values)
                 fused = vision_out.pooler_output
                 fused = fused / (fused.norm(dim=-1, keepdim=True) + 1e-12)
-        return fused[0].cpu().numpy().astype(np.float32)
+        return fused[0].cpu().numpy().astype(np.float32), None
 
     else:
         # 不匹配时尽力处理
@@ -1239,13 +1339,13 @@ def encode_frame(model, model_type, processor, pil_image):
             pixel_values = inputs['pixel_values'].to(DEVICE)
             with torch.no_grad():
                 fused = model.encode_views(pixel_values)
-            return fused[0].cpu().numpy().astype(np.float32)
+            return fused[0].cpu().numpy().astype(np.float32), None
         elif hasattr(model, 'encode'):
             inputs = processor(images=[pil_image], return_tensors="pt")
             pixel_values = inputs['pixel_values'].to(DEVICE)
             with torch.no_grad():
                 fused = model.encode(pixel_values)
-            return fused[0].cpu().numpy().astype(np.float32)
+            return fused[0].cpu().numpy().astype(np.float32), None
         else:
             inputs = processor(images=[pil_image], return_tensors="pt")
             pixel_values = inputs['pixel_values'].to(DEVICE)
@@ -1253,7 +1353,7 @@ def encode_frame(model, model_type, processor, pil_image):
                 vision_out = model.vision_model(pixel_values=pixel_values)
                 fused = vision_out.pooler_output
                 fused = fused / (fused.norm(dim=-1, keepdim=True) + 1e-12)
-            return fused[0].cpu().numpy().astype(np.float32)
+            return fused[0].cpu().numpy().astype(np.float32), None
 
 
 # =============================================================================
@@ -1297,7 +1397,31 @@ def run_video_mode(model, model_type, processor, video_dir, category_description
     视频模式主循环 (自动适配单视角/多视角):
     遍历 video_dir 下所有 mp4+标注配对, 每帧推理, 保存分析结果。
     """
+    global ACTIVE_GATE_FUSION
     category_to_idx = {cat: idx + 1 for idx, cat in enumerate(category_descriptions)}
+
+    ACTIVE_GATE_FUSION = bool(
+        USE_GATE_FUSION
+        and model_type == 'multiview'
+        and getattr(model, 'gate_inference_available', False)
+        and model.class_text_queries.shape[0] == len(category_descriptions)
+    )
+    gate_logit_order = list(range(len(category_descriptions)))
+    if ACTIVE_GATE_FUSION and getattr(model, 'class_names', None):
+        expected_names = [f"M{i + 1}" for i in range(len(category_descriptions))]
+        if set(model.class_names) == set(expected_names):
+            gate_logit_order = [model.class_names.index(name) for name in expected_names]
+        else:
+            print("  警告: checkpoint 类别顺序无法与 M1..Mn 对齐，禁用 gate 融合")
+            ACTIVE_GATE_FUSION = False
+
+    if ACTIVE_GATE_FUSION:
+        print(f"\nGate 融合: 启用 (center={CENTER_SCORE_WEIGHT:.2f}, "
+              f"query={1.0 - CENTER_SCORE_WEIGHT:.2f}, "
+              f"temperature={CENTER_SCORE_TEMPERATURE:g})")
+    else:
+        reason = "命令行已禁用" if not USE_GATE_FUSION else "checkpoint 不含可用 gate/query"
+        print(f"\nGate 融合: 关闭 ({reason})，仅使用类别中心")
 
     video_pairs = find_video_label_pairs(video_dir, label_dir)
     print(f"\n发现 {len(video_pairs)} 个视频-标注配对:")
@@ -1364,7 +1488,9 @@ def run_video_mode(model, model_type, processor, video_dir, category_description
                 pil_img = apply_background_mask(pil_img, BACKGROUND_MASK_RATIO)
 
             inference_start = time.time()
-            frame_feature = encode_frame(model, model_type, processor, pil_img)
+            frame_feature, text_logits = encode_frame(
+                model, model_type, processor, pil_img
+            )
             if DEVICE == "cuda":
                 torch.cuda.synchronize()
             inference_times.append((time.time() - inference_start) * 1000)
@@ -1373,6 +1499,11 @@ def run_video_mode(model, model_type, processor, video_dir, category_description
             nearest_category, max_similarity, all_similarities = find_nearest_category(
                 frame_feature_np, category_centers, category_descriptions
             )
+            if ACTIVE_GATE_FUSION and text_logits is not None:
+                text_logits = text_logits[gate_logit_order]
+                nearest_category, max_similarity, all_similarities = (
+                    fuse_center_and_gate_scores(all_similarities, text_logits)
+                )
 
             if USE_SIM_EMA:
                 sim_keys = list(all_similarities.keys())
@@ -1507,6 +1638,14 @@ def run_video_mode(model, model_type, processor, video_dir, category_description
         f.write("SigLIP2 Multi-View 批量测试汇总报告\n")
         f.write(f"视频根目录: {video_dir}\n")
         f.write(f"测试视频数: {len(summary_records)}\n")
+        f.write(f"Gate 融合: {'启用' if ACTIVE_GATE_FUSION else '关闭'}\n")
+        if ACTIVE_GATE_FUSION:
+            f.write(f"中心/Gate权重: {CENTER_SCORE_WEIGHT:.4f} / "
+                    f"{1.0 - CENTER_SCORE_WEIGHT:.4f}\n")
+            f.write(f"中心分数温度: {CENTER_SCORE_TEMPERATURE:.4f}\n")
+        f.write(f"相似度 EMA: {'启用' if USE_SIM_EMA else '关闭'}\n")
+        if USE_SIM_EMA:
+            f.write(f"EMA beta: {EMA_BETA:.4f}\n")
         f.write("=" * 80 + "\n\n")
 
         f.write(f"{'子目录':<25} {'视频名':<20} {'帧数':>6}  {'准确率':>8}  {'正确/总帧':>12}  "

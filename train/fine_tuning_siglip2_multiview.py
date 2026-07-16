@@ -6,8 +6,8 @@ Architecture:
   - SigLIP2 towers frozen; vision post-LayerNorm is trainable
   - Uses patch-level tokens (last_hidden_state) instead of pooler_output
   - CrossViewAttentionPooler: learnable queries cross-attend to 1024 patch tokens
-  - Frozen class-text queries cross-attend to all image patch tokens
-  - Joint SupConLoss + text-conditioned classification loss
+  - Learnable or text-initialized class queries cross-attend to image tokens
+  - Joint SupConLoss + class-query classification loss
 
 Following PaliGemma/pi0/HiROBOT pattern:
   - Freeze SigLIP, adapt downstream
@@ -18,10 +18,17 @@ Date: 2026-06-15
 """
 
 import os
+import sys
 import re
 import json
 import shutil
 import time
+
+# Allow `python train/fine_tuning_siglip2_multiview.py` to work from any
+# directory by making the repository root importable.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import numpy as np
 import torch
@@ -40,6 +47,7 @@ from siglip2_trainer.multiview_models import (
     split_image_to_views,
 )
 from siglip2_trainer.losses import SupConLoss
+from siglip2_trainer.multiview_video_dataset import MultiViewClassFolderVideoDataset
 from siglip2_trainer.checkpoints import CheckpointManager, EarlyStopping
 from siglip2_trainer.visualization import plot_loss_curve, save_training_summary
 from siglip2_trainer.logging_utils import (
@@ -82,7 +90,8 @@ def compute_multiview_class_centers(model, processor, train_dataset, config, epo
     # Group image paths by class
     class_image_paths = {c: [] for c in class_list}
     for sample in train_dataset.samples:
-        class_image_paths[sample['class']].append(sample['image_path'])
+        if sample.get('image_path') is not None or sample.get('video_path') is not None:
+            class_image_paths[sample['class']].append(sample)
 
     print(f"Classes: {len(class_list)}, Training samples: {len(train_dataset.samples)}")
 
@@ -100,15 +109,19 @@ def compute_multiview_class_centers(model, processor, train_dataset, config, epo
 
             features_list = []
             for i in range(0, len(image_paths), batch_size):
-                batch_paths = image_paths[i:i + batch_size]
+                batch_samples = image_paths[i:i + batch_size]
                 batch_views = []
 
-                for img_path in batch_paths:
+                for item in batch_samples:
                     try:
-                        with Image.open(img_path) as img:
-                            img = img.convert('RGB')
-                            img.load()
-                        views = split_image_to_views(img)
+                        if 'video_path' in item:
+                            views = train_dataset.load_views(item, apply_augmentation=False)
+                        else:
+                            img_path = item['image_path']
+                            with Image.open(img_path) as img:
+                                img = img.convert('RGB')
+                                img.load()
+                            views = split_image_to_views(img)
                         batch_views.extend(views)
                     except Exception as e:
                         print(f"    Warning: failed to load {img_path}: {e}")
@@ -139,7 +152,9 @@ def compute_multiview_class_centers(model, processor, train_dataset, config, epo
 
 def _save_graph_info(train_dataset, class_centers, config, epoch):
     """Copy and update graph_info.json with computed class centers."""
-    original_graph_path = os.path.join(train_dataset.image_root, "graph_info.json")
+    original_graph_path = getattr(config, 'GRAPH_INFO_PATH', None)
+    if not original_graph_path:
+        original_graph_path = os.path.join(train_dataset.image_root, "graph_info.json")
 
     if not os.path.exists(original_graph_path):
         print(f"  Warning: graph_info.json not found at {original_graph_path}")
@@ -204,6 +219,60 @@ def _save_graph_info(train_dataset, class_centers, config, epoch):
         print(f"  Error updating graph_info: {e}")
         import traceback
         traceback.print_exc()
+
+
+def _copy_epoch_graph_info(config, epoch, best_name):
+    """Copy an already-computed epoch graph to a best-checkpoint alias."""
+    eval_dir = os.path.join(config.MODEL_DIR, 'classification_viz')
+    src = os.path.join(eval_dir, f'graph_info_{epoch}.json')
+    dst = os.path.join(eval_dir, f'graph_info_{best_name}.json')
+    if not os.path.exists(src):
+        print(f"[Centers] Cannot create {os.path.basename(dst)}: "
+              f"missing {os.path.basename(src)}")
+        return False
+    shutil.copy2(src, dst)
+    print(f"[Centers] {os.path.basename(dst)} copied from epoch {epoch}")
+    return True
+
+
+def _load_checkpoint_memory_efficient(path):
+    """Load a large checkpoint without eagerly copying the whole file to RAM."""
+    try:
+        return torch.load(path, map_location='cpu', mmap=True, weights_only=False)
+    except TypeError:
+        # Compatibility with older PyTorch versions that do not expose mmap.
+        return torch.load(path, map_location='cpu')
+
+
+def _save_best_checkpoint_summary(config, best_loss, best_loss_epoch,
+                                  accuracy_history, accuracy_epochs):
+    """Persist lightweight best-checkpoint metadata before heavy final work."""
+    if accuracy_history:
+        best_index = int(np.argmax(accuracy_history))
+        best_eval_accuracy = float(accuracy_history[best_index])
+        best_eval_epoch = int(accuracy_epochs[best_index])
+    else:
+        best_eval_accuracy = None
+        best_eval_epoch = None
+
+    summary = {
+        'model_name': config.MODEL_NAME,
+        'best_loss': None if not np.isfinite(best_loss) else float(best_loss),
+        'best_loss_epoch': best_loss_epoch,
+        'best_loss_checkpoint': os.path.join(
+            config.MODEL_DIR, f'{config.MODEL_NAME}_best_loss.pt'
+        ),
+        'best_eval_accuracy': best_eval_accuracy,
+        'best_eval_epoch': best_eval_epoch,
+        'best_eval_checkpoint': os.path.join(
+            config.MODEL_DIR, f'{config.MODEL_NAME}_best_eval.pt'
+        ),
+        'recommended_for_test': 'best_eval' if best_eval_epoch is not None else 'best_loss',
+    }
+    summary_path = os.path.join(config.MODEL_DIR, 'best_checkpoint_summary.json')
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"Best-checkpoint summary saved: {summary_path}")
 
 
 # =============================================================================
@@ -329,6 +398,8 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
     metrics = {
         'accuracy': accuracy,
         'center_only_accuracy': center_only_correct / total if total > 0 else 0,
+        'query_only_accuracy': text_only_correct / total if total > 0 else 0,
+        # Backward-compatible key for existing result readers.
         'text_only_accuracy': text_only_correct / total if total > 0 else 0,
         'correct': correct,
         'total': total,
@@ -338,7 +409,7 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
 
     print(f"  Overall accuracy: {accuracy:.1%} ({correct}/{total})")
     print(f"  Center-only accuracy: {metrics['center_only_accuracy']:.1%}")
-    print(f"  Text-only accuracy:   {metrics['text_only_accuracy']:.1%}")
+    print(f"  Query-only accuracy:  {metrics['query_only_accuracy']:.1%}")
     print(f"\n  Per-class accuracy:")
     for cls in class_list:
         acc = per_class_accuracy[cls]
@@ -384,6 +455,7 @@ def evaluate_multiview_with_class_centers(model, processor, val_dataset, class_c
         'metrics': {
             'accuracy': float(accuracy),
             'center_only_accuracy': float(metrics['center_only_accuracy']),
+            'query_only_accuracy': float(metrics['query_only_accuracy']),
             'text_only_accuracy': float(metrics['text_only_accuracy']),
             'correct': int(correct),
             'total': int(total),
@@ -434,8 +506,8 @@ def train_one_epoch(model, supcon_fn, optimizer, dataloader, epoch, config):
         pixel_values = batch['pixel_values'].to(config.DEVICE)  # [4B, C, H, W]
         labels = batch['labels'].to(config.DEVICE)
 
-        # Every image is scored against every cached class prompt. The label is
-        # used only by the losses, never injected as an input prompt.
+        # Every image is scored against every class query. The label is used
+        # only by the losses, never injected as an input query.
         image_embeds, class_logits = model(pixel_values)
 
         supcon_loss = supcon_fn(image_embeds, labels)
@@ -487,7 +559,8 @@ def main():
     print(f"Pooler:          {config.POOLER_NUM_LAYERS} layers, {config.POOLER_NUM_HEADS} heads")
     print(f"Scheduler:       {config.SCHEDULER_TYPE}")
     print("SigLIP:          frozen towers + trainable vision post-LN")
-    print(f"Text fusion:     gated cross-attention, CE weight={config.TEXT_CE_WEIGHT}")
+    print(f"Class-query gate: mode={config.CLASS_QUERY_MODE}, "
+          f"CE weight={config.TEXT_CE_WEIGHT}")
     print(f"Early stopping:  {config.EARLY_STOPPING}")
     if config.EARLY_STOPPING:
         print(f"  Patience:      {config.PATIENCE}")
@@ -502,7 +575,28 @@ def main():
 
     # ===== Dataset =====
     print("Loading multi-view dataset...")
-    train_dataset = MultiViewSimpleDataset(
+    dataset_cls = (MultiViewClassFolderVideoDataset
+                   if config.DATA_MODE == 'video_class_folders'
+                   else MultiViewSimpleDataset)
+    if dataset_cls is MultiViewClassFolderVideoDataset:
+        train_dataset = dataset_cls(
+            split_root=config.VIDEO_DATA_ROOT, split='train',
+            frames_per_video=config.VIDEO_FRAMES_PER_VIDEO,
+            use_augmentation=config.USE_AUGMENTATION,
+            augmentation_config=config.AUGMENTATION_CONFIG,
+        )
+        val_dataset = dataset_cls(
+            split_root=config.VIDEO_DATA_ROOT, split='val',
+            frames_per_video=config.VIDEO_FRAMES_PER_VIDEO,
+            use_augmentation=False,
+        )
+        test_dataset = dataset_cls(
+            split_root=config.VIDEO_DATA_ROOT, split='test',
+            frames_per_video=config.VIDEO_FRAMES_PER_VIDEO,
+            use_augmentation=False,
+        )
+    else:
+        train_dataset = MultiViewSimpleDataset(
         image_root=config.IMAGE_ROOT,
         text_root=None,
         use_augmentation=config.USE_AUGMENTATION,
@@ -513,7 +607,7 @@ def main():
         split='train',
     )
 
-    val_dataset = MultiViewSimpleDataset(
+        val_dataset = MultiViewSimpleDataset(
         image_root=config.IMAGE_ROOT,
         text_root=None,
         use_augmentation=False,
@@ -521,21 +615,32 @@ def main():
         val_ratio=config.VAL_RATIO,
         test_ratio=0.0,
         split='val',
-    )
+        )
+        test_dataset = None
 
-    # Encode all candidate prompts once with the frozen SigLIP text tower.
-    # The query order exactly follows dataset.class_to_idx / integer labels.
-    model.set_class_prompts(
-        processor=processor,
-        class_names=train_dataset.classes,
-        class_prompts=config.CLASS_PROMPTS,
-        max_length=config.MAX_TEXT_LENGTH,
-    )
+    # Bind query rows to dataset.class_to_idx / integer-label order. Learnable
+    # mode removes manual language prompts; text mode preserves old behavior.
+    if config.CLASS_QUERY_MODE == 'learnable':
+        model.set_learnable_class_names(train_dataset.classes)
+    elif config.CLASS_QUERY_MODE == 'text':
+        model.set_class_prompts(
+            processor=processor,
+            class_names=train_dataset.classes,
+            class_prompts=config.CLASS_PROMPTS,
+            max_length=config.MAX_TEXT_LENGTH,
+        )
+    else:
+        raise ValueError(f"Unsupported CLASS_QUERY_MODE: {config.CLASS_QUERY_MODE!r}")
 
     print(f"\nDataset split:")
     print(f"  Train: {len(train_dataset)} samples")
     print(f"  Val:   {len(val_dataset)} samples")
-    print(f"  Split: train {1-config.VAL_RATIO:.0%} / val {config.VAL_RATIO:.0%}")
+    if test_dataset is not None:
+        print(f"  Test:  {len(test_dataset)} samples (held out; not used for model selection)")
+    if config.DATA_MODE == 'video_class_folders':
+        print("  Split: predefined train / val / test directories")
+    else:
+        print(f"  Split: train {1-config.VAL_RATIO:.0%} / val {config.VAL_RATIO:.0%}")
     print(f"  Eval interval: every {config.EVAL_EVERY_N_EPOCHS} epochs")
     print()
 
@@ -554,7 +659,11 @@ def main():
 
     # ===== Save training config =====
     print("Collecting training configuration...")
-    dataset_info = collect_dataset_info(train_dataset, config.IMAGE_ROOT, None)
+    dataset_info = collect_dataset_info(
+        train_dataset,
+        config.VIDEO_DATA_ROOT if config.DATA_MODE == 'video_class_folders' else config.IMAGE_ROOT,
+        None,
+    )
     dataset_info['mode'] = 'multi-view V2 (patch-level cross-attention)'
     dataset_info['views_per_sample'] = config.NUM_VIEWS
     model_info = collect_model_info(model)
@@ -581,6 +690,7 @@ def main():
     # ===== Resume from checkpoint =====
     start_epoch = 0
     best_loss = float('inf')
+    best_loss_epoch = None
 
     if config.RESUME_FROM_CHECKPOINT:
         try:
@@ -590,6 +700,7 @@ def main():
             start_epoch = resume_info.get('start_epoch', 0)
             if resume_info.get('previous_loss') is not None:
                 best_loss = resume_info['previous_loss']
+                best_loss_epoch = max(0, start_epoch - 1)
             print(f"\nResumed from checkpoint")
         except Exception as e:
             print(f"\nCheckpoint load failed: {e}")
@@ -629,6 +740,7 @@ def main():
         is_best = avg_loss < best_loss
         if is_best:
             best_loss = avg_loss
+            best_loss_epoch = epoch
             best_loss_updated = True
             checkpoint_manager.save_best_loss(model, optimizer, epoch, avg_loss, current_lr, scheduler)
 
@@ -652,13 +764,7 @@ def main():
                 print(f"[Centers] Computation failed: {e}\n{traceback.format_exc()}")
 
             if best_loss_updated and is_best and _cached_centers is not None:
-                src = os.path.join(config.MODEL_DIR, 'classification_viz',
-                                   f'graph_info_{epoch}.json')
-                dst = os.path.join(config.MODEL_DIR, 'classification_viz',
-                                   'graph_info_best_loss.json')
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
-                    print(f"[Centers] graph_info_best_loss.json copied from epoch {epoch}")
+                _copy_epoch_graph_info(config, epoch, 'best_loss')
                 best_loss_updated = False
 
         marker = " BEST_LOSS" if is_best else ""
@@ -705,6 +811,10 @@ def main():
                             model, optimizer, epoch, metrics['accuracy'],
                             avg_loss, current_lr, scheduler
                         )
+                        # Centers for this exact epoch were computed immediately
+                        # before evaluation, so save the matching JSON now. This
+                        # survives early stopping and avoids reloading a 5GB model.
+                        _copy_epoch_graph_info(config, epoch, 'best_eval')
 
             except Exception as e:
                 import traceback
@@ -730,6 +840,10 @@ def main():
     print("=" * 60)
     print(f"\nSaved checkpoints: {checkpoint_manager.get_saved_epochs()}")
 
+    _save_best_checkpoint_summary(
+        config, best_loss, best_loss_epoch, accuracy_history, accuracy_epochs
+    )
+
     # ===== Save final graph_info for best models =====
     print(f"\n{'='*60}")
     print(f"[Saving best model graph_info.json]")
@@ -739,10 +853,13 @@ def main():
     if os.path.exists(best_loss_path):
         print(f"\nProcessing graph_info_best_loss.json...")
         try:
-            checkpoint = torch.load(best_loss_path, map_location='cpu')
+            checkpoint = _load_checkpoint_memory_efficient(best_loss_path)
+            checkpoint_epoch = checkpoint['epoch']
+            checkpoint_loss = checkpoint['loss']
             model.load_state_dict(checkpoint['model_state_dict'])
+            del checkpoint
             model.to(config.DEVICE)
-            print(f"  Loaded: epoch={checkpoint['epoch']}, loss={checkpoint['loss']:.4f}")
+            print(f"  Loaded: epoch={checkpoint_epoch}, loss={checkpoint_loss:.4f}")
 
             compute_multiview_class_centers(
                 model, processor, train_dataset, config, 'best_loss'
@@ -754,10 +871,13 @@ def main():
     if os.path.exists(best_eval_path) and accuracy_history:
         print(f"\nProcessing graph_info_best_eval.json...")
         try:
-            checkpoint = torch.load(best_eval_path, map_location='cpu')
+            checkpoint = _load_checkpoint_memory_efficient(best_eval_path)
+            checkpoint_epoch = checkpoint['epoch']
+            checkpoint_accuracy = checkpoint['eval_accuracy']
             model.load_state_dict(checkpoint['model_state_dict'])
+            del checkpoint
             model.to(config.DEVICE)
-            print(f"  Loaded: epoch={checkpoint['epoch']}, accuracy={checkpoint['eval_accuracy']:.2%}")
+            print(f"  Loaded: epoch={checkpoint_epoch}, accuracy={checkpoint_accuracy:.2%}")
 
             compute_multiview_class_centers(
                 model, processor, train_dataset, config, 'best_eval'

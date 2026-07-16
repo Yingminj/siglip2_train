@@ -6,7 +6,7 @@ Architecture (following PaliGemma/pi0 pattern):
   - SigLIP2 towers frozen, with trainable vision post-LayerNorm
   - Uses last_hidden_state (patch tokens) instead of pooler_output
   - CrossViewAttentionPooler: learnable queries cross-attend to all patch tokens
-  - Frozen class-text queries perform gated cross-attention over image tokens
+  - Learnable or text-initialized class queries gate image-token attention
   - View position embeddings distinguish camera origins
 
 Modules:
@@ -232,9 +232,9 @@ class CrossViewAttentionPooler(nn.Module):
 
 
 class TextConditionedGatedCrossAttention(nn.Module):
-    """Score every candidate class text against the multi-view image tokens.
+    """Score every candidate class query against multi-view image tokens.
 
-    Class text embeddings are queries and image patch tokens are keys/values.
+    Class embeddings are queries and image patch tokens are keys/values.
     Every image is compared with every class query, so the ground-truth label is
     never injected into the input.  The gate follows the idea used by GenLIP,
     but is kept separate from q_proj so pretrained SigLIP weights remain intact.
@@ -349,7 +349,7 @@ class MultiViewSigLIPModel(nn.Module):
     """
 
     def __init__(self, base_model, pooler, num_views=4, embed_dim=1152,
-                 text_fusion=None):
+                 text_fusion=None, class_query_mode="text", num_classes=None):
         super().__init__()
         self.base_model = base_model
         self.pooler = pooler
@@ -358,14 +358,28 @@ class MultiViewSigLIPModel(nn.Module):
         )
         self.num_views = num_views
         self.class_names = []
+        self.class_query_mode = class_query_mode
 
-        # Filled once by set_class_prompts(). Persistent so checkpoints retain
-        # the exact frozen text queries used during training and inference.
-        self.register_buffer(
-            'class_text_queries',
-            torch.empty(0, embed_dim),
-            persistent=True,
-        )
+        if class_query_mode == "learnable":
+            if not num_classes or num_classes < 1:
+                raise ValueError("num_classes must be positive for learnable class queries")
+            # Keep the historical state-dict key for checkpoint/test compatibility.
+            self.class_text_queries = nn.Parameter(
+                torch.empty(num_classes, embed_dim)
+            )
+            nn.init.trunc_normal_(self.class_text_queries, std=0.02)
+        elif class_query_mode == "text":
+            # Filled once by set_class_prompts(). Persistent so checkpoints retain
+            # the exact frozen text queries used during training and inference.
+            self.register_buffer(
+                'class_text_queries',
+                torch.empty(0, embed_dim),
+                persistent=True,
+            )
+        else:
+            raise ValueError(
+                f"class_query_mode must be 'learnable' or 'text', got {class_query_mode!r}"
+            )
 
         # View position embedding: [num_views, 1, D]
         # Broadcast-added to each view's 256 patch tokens
@@ -381,13 +395,29 @@ class MultiViewSigLIPModel(nn.Module):
         """Persist prompt order/text alongside tensor weights in checkpoints."""
         return {
             'class_names': self.class_names,
+            'class_query_mode': self.class_query_mode,
             'resolved_class_prompts': getattr(self, 'resolved_class_prompts', {}),
         }
 
     def set_extra_state(self, state):
         state = state or {}
         self.class_names = list(state.get('class_names', []))
+        self.loaded_class_query_mode = state.get('class_query_mode')
         self.resolved_class_prompts = dict(state.get('resolved_class_prompts', {}))
+
+    def set_learnable_class_names(self, class_names):
+        """Bind dataset label order to the trainable class-query rows."""
+        if self.class_query_mode != "learnable":
+            raise RuntimeError("set_learnable_class_names requires learnable query mode")
+        if len(class_names) != self.class_text_queries.shape[0]:
+            raise ValueError(
+                f"Configured {self.class_text_queries.shape[0]} learnable queries, "
+                f"but dataset has {len(class_names)} classes"
+            )
+        self.class_names = list(class_names)
+        self.resolved_class_prompts = {}
+        print(f"Initialized {len(self.class_names)} learnable class queries in order: "
+              f"{self.class_names}")
 
     @torch.no_grad()
     def set_class_prompts(self, processor, class_names, class_prompts=None,
@@ -398,6 +428,8 @@ class MultiViewSigLIPModel(nn.Module):
         prompt variants. Multiple variants are averaged into one class query.
         Missing entries fall back to the class name and emit a warning.
         """
+        if self.class_query_mode != "text":
+            raise RuntimeError("set_class_prompts requires text query mode")
         class_prompts = class_prompts or {}
         tokenizer = getattr(processor, 'tokenizer', processor)
         device = next(self.base_model.parameters()).device
@@ -490,8 +522,8 @@ class MultiViewSigLIPModel(nn.Module):
     def forward(self, pixel_values):
         if self.class_text_queries.numel() == 0:
             raise RuntimeError(
-                "Class text queries are not initialized. Call "
-                "model.set_class_prompts(...) before training or inference."
+                "Class queries are not initialized. Configure learnable queries "
+                "or call model.set_class_prompts(...) before training/inference."
             )
 
         image_embeds, patch_tokens = self.encode_views(
@@ -555,6 +587,8 @@ def setup_multiview_model(config):
         num_views=config.NUM_VIEWS,
         embed_dim=embed_dim,
         text_fusion=text_fusion,
+        class_query_mode=getattr(config, 'CLASS_QUERY_MODE', 'text'),
+        num_classes=config.NUM_CLASSES,
     )
     model = model.to(config.DEVICE)
 
@@ -563,13 +597,15 @@ def setup_multiview_model(config):
     for param in model.parameters():
         param.requires_grad = False
 
-    # Unfreeze trainable modules: view position, image pooler, text-conditioned
+    # Unfreeze trainable modules: view position, image pooler, class-query
     # fusion, and the small pretrained vision output LayerNorm.
     model.view_pos_embed.requires_grad = True
     for param in model.pooler.parameters():
         param.requires_grad = True
     for param in model.text_fusion.parameters():
         param.requires_grad = True
+    if isinstance(model.class_text_queries, nn.Parameter):
+        model.class_text_queries.requires_grad = True
     for param in model.base_model.vision_model.post_layernorm.parameters():
         param.requires_grad = True
 
@@ -593,6 +629,8 @@ def setup_multiview_model(config):
         + list(model.text_fusion.parameters())
         + [model.view_pos_embed]
     )
+    if isinstance(model.class_text_queries, nn.Parameter):
+        pooler_params.append(model.class_text_queries)
     vision_norm_params = list(model.base_model.vision_model.post_layernorm.parameters())
     optimizer = optim.AdamW(
         [

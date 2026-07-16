@@ -2,7 +2,7 @@
 """Convert a 2x2 camera video into a 3-view horizontal video.
 
 Input:  1280x960 (four 640x480 quadrants)
-Output: 1920x480 ([view1 | view2 | view3])
+Output: 1920x480 ([center | left | right])
 
 Example:
     python tools/convert_2x2_video_to_3view.py input.mp4 output.mp4
@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument(
         "--views", nargs=3, default=["tl", "tr", "bl"], choices=sorted(QUADRANTS),
         metavar=("VIEW1", "VIEW2", "VIEW3"),
-        help="三个视角的象限，默认 tl tr bl；可选 tl/tr/bl/br",
+        help="三个视角的象限，默认 tl tr bl（中、左手、右手）；可选 tl/tr/bl/br",
     )
     parser.add_argument("--fps", type=float, default=None,
                         help="输出帧率，默认沿用输入帧率")
