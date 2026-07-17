@@ -146,6 +146,11 @@ def compute_multiview_class_centers(model, processor, train_dataset, config, epo
     # Save to graph_info.json
     _save_graph_info(train_dataset, class_centers, config, epoch)
 
+    # Release cv2.VideoCapture handles so that DataLoader workers forked
+    # in the next epoch do not inherit corrupted OpenCV state.
+    if hasattr(train_dataset, 'close'):
+        train_dataset.close()
+
     model.train()
     return class_centers
 
