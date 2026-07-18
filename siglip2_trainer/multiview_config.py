@@ -56,9 +56,10 @@ class MultiViewConfig:
     # "image": image class folders.
     # "video": MP4 files with frame-level TXT labels.
     # "video_class_folders": predefined train/val/test/M1...M6 directories.
-    DATA_MODE = "video_class_folders"
+    # "video_class_folders_transition": class_folders + transition-dense video data.
+    DATA_MODE = "video_class_folders_transition"
     IMAGE_ROOT = "/home/liuqian/Aqcy/gift_m6_picture_train40_mult_0630"
-    VIDEO_DATA_ROOT = "/home/liuqian/Aqcy/0716_3view_rosbag"
+    VIDEO_DATA_ROOT = "/home/liuqian/Aqcy/datagift_0716_rsb"
     VIDEO_FRAMES_PER_VIDEO = 24
     GRAPH_INFO_PATH = "/home/liuqian/Aqcy/gift_m6_picture_train40_mult_0630/graph_info.json"
     VIDEO_ROOT = "/home/liuqian/Aqcy/cube_data/cubedata_multiviewer_0713"
@@ -66,8 +67,20 @@ class MultiViewConfig:
     VIDEO_FRAME_STRIDE = 5       # 1=每帧；5=每 5 帧采一帧
     VIDEO_SAMPLES_PER_CLASS = 1000  # 每状态总数；按 VAL_RATIO 分为 800/200
 
+    # ---- 边界效应优化 ----
+    # 类文件夹模式下，跳过视频首尾的比例（0.0=保留全部帧，包括边界帧）
+    EDGE_FRACTION = 0.0
+    # 边界强调: 0.0=均匀采样, 0.3=30%样本集中在视频首尾20%区域
+    BOUNDARY_EMPHASIS = 0.25
+    # 过渡帧密集采样: 标签切换点前后各 N 帧
+    TRANSITION_WINDOW = 30
+    # 过渡窗口内的采样步长 (1=每帧都采)
+    TRANSITION_DENSE_STRIDE = 2
+    # 过渡帧数据集占总训练数据的比例 (0.0=不加过渡数据, 0.3=30%)
+    TRANSITION_MIX_RATIO = 0.3
+
     # === Save paths ===
-    MODEL_DIR  = "/home/liuqian/Aqcy/train_giftvedio_0716/trainresult_0716_3view_rosbag"
+    MODEL_DIR  = "/home/liuqian/Aqcy/train_giftvedio_0717/trainresult_0717_base"
     MODEL_NAME = "baseline"
 
     # === Resume ===

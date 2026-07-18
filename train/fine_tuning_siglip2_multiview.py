@@ -25,7 +25,7 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from PIL import Image
 
 # Allow launching this script from any working directory.
@@ -651,6 +651,92 @@ def main():
         test_dataset = MultiViewClassFolderVideoDataset(
             **class_folder_kwargs, split='test', use_augmentation=False,
         )
+        dataset_root_for_logging = config.VIDEO_DATA_ROOT
+    elif config.DATA_MODE == 'video_class_folders_transition':
+        # 类文件夹数据（边界强调采样）+ 连续标注视频（过渡帧密集采样）
+        # 解决 M1→M2, M2→M3 等状态切换边界的识别问题
+        edge_fraction = getattr(config, 'EDGE_FRACTION', 0.0)
+        boundary_emphasis = getattr(config, 'BOUNDARY_EMPHASIS', 0.25)
+        trans_window = getattr(config, 'TRANSITION_WINDOW', 30)
+        trans_stride = getattr(config, 'TRANSITION_DENSE_STRIDE', 2)
+        trans_mix_ratio = getattr(config, 'TRANSITION_MIX_RATIO', 0.3)
+
+        print(f"\n[边界效应优化]")
+        print(f"  edge_fraction={edge_fraction}")
+        print(f"  boundary_emphasis={boundary_emphasis}")
+        print(f"  transition_window=±{trans_window}")
+        print(f"  transition_dense_stride={trans_stride}")
+        print(f"  transition_mix_ratio={trans_mix_ratio}")
+
+        # 1) 类文件夹数据集（含边界强调采样）
+        class_folder_kwargs = dict(
+            split_root=config.VIDEO_DATA_ROOT,
+            frames_per_video=config.VIDEO_FRAMES_PER_VIDEO,
+            edge_fraction=edge_fraction,
+            boundary_emphasis=boundary_emphasis,
+        )
+        train_class_folder = MultiViewClassFolderVideoDataset(
+            **class_folder_kwargs,
+            split='train',
+            use_augmentation=config.USE_AUGMENTATION,
+            augmentation_config=config.AUGMENTATION_CONFIG,
+        )
+        val_dataset = MultiViewClassFolderVideoDataset(
+            **class_folder_kwargs, split='val', use_augmentation=False,
+        )
+        test_dataset = MultiViewClassFolderVideoDataset(
+            **class_folder_kwargs, split='test', use_augmentation=False,
+        )
+
+        # 2) 连续标注视频数据集（过渡帧密集采样）
+        if trans_mix_ratio > 0.0 and hasattr(config, 'VIDEO_ROOT') and hasattr(config, 'VIDEO_LABEL_ROOT'):
+            video_root = config.VIDEO_ROOT
+            label_root = config.VIDEO_LABEL_ROOT
+            if os.path.isdir(video_root) and os.path.isdir(label_root):
+                video_dataset_kwargs = dict(
+                    video_root=video_root,
+                    label_root=label_root,
+                    val_ratio=config.VAL_RATIO,
+                    frame_stride=config.VIDEO_FRAME_STRIDE,
+                    max_samples_per_class=config.VIDEO_SAMPLES_PER_CLASS,
+                    transition_window=trans_window,
+                    transition_dense_stride=trans_stride,
+                )
+                train_transition = MultiViewVideoDataset(
+                    **video_dataset_kwargs,
+                    split='train',
+                    use_augmentation=config.USE_AUGMENTATION,
+                    augmentation_config=config.AUGMENTATION_CONFIG,
+                )
+
+                # 按比例混合: 从过渡数据集中随机取 trans_mix_ratio 比例
+                n_transition = int(len(train_transition) * trans_mix_ratio)
+                if n_transition > 0 and n_transition < len(train_transition):
+                    indices = np.round(
+                        np.linspace(0, len(train_transition) - 1, n_transition)
+                    ).astype(int)
+                    train_transition.samples = [train_transition.samples[i] for i in indices]
+                    print(f"  过渡数据集采样: {n_transition} frames (ratio={trans_mix_ratio})")
+
+                if len(train_transition) > 0:
+                    train_dataset = ConcatDataset([train_class_folder, train_transition])
+                    # ConcatDataset 没有 .classes/.samples/.load_views/.image_root,
+                    # 从 class_folder 子数据集桥接这些属性供下游使用
+                    train_dataset.classes = train_class_folder.classes
+                    train_dataset.class_to_idx = train_class_folder.class_to_idx
+                    train_dataset.samples = train_class_folder.samples
+                    train_dataset.load_views = train_class_folder.load_views
+                    train_dataset.image_root = train_class_folder.image_root
+                    print(f"  混合训练集: class_folder={len(train_class_folder)} + "
+                          f"transition={len(train_transition)} = {len(train_dataset)} frames")
+                else:
+                    train_dataset = train_class_folder
+            else:
+                print(f"  ⚠ 连续视频数据不可用, 仅使用类文件夹数据")
+                train_dataset = train_class_folder
+        else:
+            train_dataset = train_class_folder
+
         dataset_root_for_logging = config.VIDEO_DATA_ROOT
     elif config.DATA_MODE == 'video':
         video_dataset_kwargs = dict(
