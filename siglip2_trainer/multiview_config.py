@@ -80,7 +80,7 @@ class MultiViewConfig:
     TRANSITION_MIX_RATIO = 0.3
 
     # === Save paths ===
-    MODEL_DIR  = "/home/liuqian/Aqcy/train_giftvedio_0717/trainresult_0717_base"
+    MODEL_DIR  = "/home/liuqian/Aqcy/train_giftvedio_0718/trainresult_0718_base"
     MODEL_NAME = "baseline"
 
     # === Resume ===
